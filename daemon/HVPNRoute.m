@@ -1,0 +1,228 @@
+#import "HVPNRoute.h"
+
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <net/route.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define HVPN_ROUNDUP(a) ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))
+
+NSString *HVPNErrnoString(void) {
+    return [NSString stringWithUTF8String:strerror(errno)] ?: @"unknown error";
+}
+
+static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
+                       unsigned ifindex, NSString *gateway) {
+    int fd = socket(PF_ROUTE, SOCK_RAW, family == AF_INET6 ? AF_INET6 : AF_INET);
+    if (fd < 0) return -1;
+
+    char buf[512];
+    memset(buf, 0, sizeof(buf));
+
+    struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
+    char *cp = buf + sizeof(struct rt_msghdr);
+    int len = (int)sizeof(struct rt_msghdr);
+
+    rtm->rtm_version = RTM_VERSION;
+    rtm->rtm_type = (u_char)cmd;
+    rtm->rtm_flags = RTF_UP | RTF_STATIC;
+    rtm->rtm_addrs = RTA_DST | RTA_NETMASK | RTA_GATEWAY;
+
+    if (family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)cp;
+        sin->sin_len = sizeof(struct sockaddr_in);
+        sin->sin_family = AF_INET;
+        memcpy(&sin->sin_addr, dst, 4);
+        cp += sizeof(struct sockaddr_in);
+        len += (int)sizeof(struct sockaddr_in);
+
+        sin = (struct sockaddr_in *)cp;
+        sin->sin_len = sizeof(struct sockaddr_in);
+        sin->sin_family = AF_INET;
+        in_addr_t mask = (prefix <= 0) ? 0 : htonl(0xFFFFFFFFu << (32 - prefix));
+        sin->sin_addr.s_addr = mask;
+        cp += sizeof(struct sockaddr_in);
+        len += (int)sizeof(struct sockaddr_in);
+    } else {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)cp;
+        s6->sin6_len = sizeof(struct sockaddr_in6);
+        s6->sin6_family = AF_INET6;
+        memcpy(&s6->sin6_addr, dst, 16);
+        cp += sizeof(struct sockaddr_in6);
+        len += (int)sizeof(struct sockaddr_in6);
+
+        uint8_t mask[16];
+        memset(mask, 0, sizeof(mask));
+        int full = prefix / 8;
+        for (int i = 0; i < full && i < 16; i++) mask[i] = 0xFF;
+        if (prefix % 8 && full < 16) mask[full] = (uint8_t)(0xFF << (8 - prefix % 8));
+
+        s6 = (struct sockaddr_in6 *)cp;
+        s6->sin6_len = sizeof(struct sockaddr_in6);
+        s6->sin6_family = AF_INET6;
+        memcpy(&s6->sin6_addr, mask, 16);
+        cp += sizeof(struct sockaddr_in6);
+        len += (int)sizeof(struct sockaddr_in6);
+    }
+
+    if (gateway.length) {
+        if (family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)cp;
+            sin->sin_len = sizeof(struct sockaddr_in);
+            sin->sin_family = AF_INET;
+            if (inet_pton(AF_INET, gateway.UTF8String, &sin->sin_addr) != 1) {
+                close(fd);
+                errno = EINVAL;
+                return -1;
+            }
+            cp += sizeof(struct sockaddr_in);
+            len += (int)sizeof(struct sockaddr_in);
+        } else {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)cp;
+            s6->sin6_len = sizeof(struct sockaddr_in6);
+            s6->sin6_family = AF_INET6;
+            if (inet_pton(AF_INET6, gateway.UTF8String, &s6->sin6_addr) != 1) {
+                close(fd);
+                errno = EINVAL;
+                return -1;
+            }
+            cp += sizeof(struct sockaddr_in6);
+            len += (int)sizeof(struct sockaddr_in6);
+        }
+    } else {
+        struct sockaddr_dl *sdl = (struct sockaddr_dl *)cp;
+        sdl->sdl_len = sizeof(struct sockaddr_dl);
+        sdl->sdl_family = AF_LINK;
+        sdl->sdl_index = (unsigned short)ifindex;
+        sdl->sdl_nlen = 0;
+        cp += sizeof(struct sockaddr_dl);
+        len += (int)sizeof(struct sockaddr_dl);
+    }
+
+    rtm->rtm_msglen = (u_short)len;
+    rtm->rtm_index = (unsigned short)ifindex;
+
+    ssize_t rc;
+    do {
+        rc = write(fd, buf, (size_t)len);
+    } while (rc < 0 && errno == EINTR);
+
+    int savedErrno = errno;
+    close(fd);
+    if (rc < 0) {
+        errno = savedErrno;
+        return -1;
+    }
+    return 0;
+}
+
+static BOOL HVPNParseAddr(int family, NSString *text, uint8_t out[16]) {
+    memset(out, 0, 16);
+    return inet_pton(family, text.UTF8String, out) == 1;
+}
+
+int HVPNRouteAddInterface(int family, NSString *dst, int prefix, unsigned ifindex) {
+    uint8_t addr[16];
+    if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
+    return HVPNRouteOp(RTM_ADD, family, addr, prefix, ifindex, nil);
+}
+
+int HVPNRouteDeleteInterface(int family, NSString *dst, int prefix, unsigned ifindex) {
+    uint8_t addr[16];
+    if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
+    return HVPNRouteOp(RTM_DELETE, family, addr, prefix, ifindex, nil);
+}
+
+int HVPNRouteAddHost(int family, NSString *dst, NSString *gateway, unsigned ifindex) {
+    uint8_t addr[16];
+    if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
+    return HVPNRouteOp(RTM_ADD, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
+}
+
+int HVPNRouteDeleteHost(int family, NSString *dst, NSString *gateway, unsigned ifindex) {
+    uint8_t addr[16];
+    if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
+    return HVPNRouteOp(RTM_DELETE, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
+}
+
+BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {
+    int mib[6] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_DUMP, 0};
+    size_t needed = 0;
+    if (sysctl(mib, 6, NULL, &needed, NULL, 0) < 0 || needed == 0) return NO;
+
+    char *buf = malloc(needed);
+    if (buf == NULL) return NO;
+    if (sysctl(mib, 6, buf, &needed, NULL, 0) < 0) {
+        free(buf);
+        return NO;
+    }
+
+    BOOL found = NO;
+    NSString *resultGateway = nil;
+    unsigned resultIndex = 0;
+
+    char *p = buf;
+    char *end = buf + needed;
+    while (p + sizeof(struct rt_msghdr) <= end) {
+        struct rt_msghdr *rtm = (struct rt_msghdr *)p;
+        if (rtm->rtm_msglen == 0) break;
+        p += rtm->rtm_msglen;
+
+        if (rtm->rtm_type != RTM_GET) continue;
+        if (!(rtm->rtm_flags & RTF_GATEWAY)) continue;
+
+        struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
+        struct sockaddr *dstSA = NULL, *gwSA = NULL, *maskSA = NULL;
+        for (int i = 1; i <= RTAX_MAX; i++) {
+            if (!(rtm->rtm_addrs & (1 << (i - 1)))) continue;
+            if (sa->sa_len == 0) break;
+            if (i == RTAX_DST) dstSA = sa;
+            if (i == RTAX_GATEWAY) gwSA = sa;
+            if (i == RTAX_NETMASK) maskSA = sa;
+            sa = (struct sockaddr *)((char *)sa + HVPN_ROUNDUP(sa->sa_len));
+        }
+        if (dstSA == NULL || gwSA == NULL) continue;
+        if (dstSA->sa_family != family || gwSA->sa_family != family) continue;
+
+        BOOL isDefault = NO;
+        if (family == AF_INET) {
+            struct sockaddr_in *d = (struct sockaddr_in *)dstSA;
+            isDefault = (d->sin_addr.s_addr == INADDR_ANY);
+        } else {
+            struct sockaddr_in6 *d = (struct sockaddr_in6 *)dstSA;
+            isDefault = IN6_IS_ADDR_UNSPECIFIED(&d->sin6_addr);
+        }
+        if (!isDefault) continue;
+        if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in)) {
+            uint32_t m = 0;
+            if (family == AF_INET) m = ((struct sockaddr_in *)maskSA)->sin_addr.s_addr;
+            else m = 0;
+            if (m != 0) continue;
+        }
+
+        char text[INET6_ADDRSTRLEN];
+        memset(text, 0, sizeof(text));
+        const void *src = (family == AF_INET)
+            ? (const void *)&((struct sockaddr_in *)gwSA)->sin_addr
+            : (const void *)&((struct sockaddr_in6 *)gwSA)->sin6_addr;
+        if (inet_ntop(family, src, text, sizeof(text)) != NULL) {
+            resultGateway = [NSString stringWithUTF8String:text];
+            resultIndex = rtm->rtm_index;
+            found = YES;
+        }
+        if (found) break;
+    }
+
+    free(buf);
+    if (!found) return NO;
+    if (gateway) *gateway = resultGateway;
+    if (ifindex) *ifindex = resultIndex;
+    return YES;
+}

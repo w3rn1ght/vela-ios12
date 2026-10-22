@@ -1,0 +1,32 @@
+#!/bin/sh
+# postinst: права, каталоги и запуск демона.
+DAEMON_PLIST=/Library/LaunchDaemons/com.happvpn.daemon.plist
+STATE_DIR=/var/mobile/Library/HappVPN
+LOG_DIR=/var/mobile/Library/Logs/HappVPN
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+chown root:wheel "$STATE_DIR" 2>/dev/null || true
+chown root:wheel "$LOG_DIR" 2>/dev/null || true
+chmod 755 "$STATE_DIR" "$LOG_DIR"
+
+chown root:wheel /usr/libexec/happvpnd 2>/dev/null || true
+chmod 755 /usr/libexec/happvpnd
+
+if [ -f /usr/libexec/happvpn/sing-box ]; then
+	chown root:wheel /usr/libexec/happvpn/sing-box 2>/dev/null || true
+	chmod 755 /usr/libexec/happvpn/sing-box
+fi
+
+chown root:wheel "$DAEMON_PLIST" 2>/dev/null || true
+chmod 644 "$DAEMON_PLIST"
+
+launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
+launchctl load "$DAEMON_PLIST" 2>/dev/null || true
+
+if [ -x /usr/bin/uicache ]; then
+	uicache -p /Applications/HappVPN.app 2>/dev/null || true
+elif [ -x /usr/bin/uicache-legacy ]; then
+	uicache-legacy 2>/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,19 @@
+#!/bin/sh
+# postrm: остановить демон и убрать маршруты, если он не успел этого сделать.
+DAEMON_PLIST=/Library/LaunchDaemons/com.happvpn.daemon.plist
+
+launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
+
+if [ -x /sbin/route ]; then
+	for net in "0.0.0.0/1" "128.0.0.0/1" "::/1" "8000::/1"; do
+		/sbin/route delete -net "$net" >/dev/null 2>&1 || true
+	done
+fi
+
+rm -rf /var/mobile/Library/HappVPN
+
+if [ -x /usr/bin/uicache ]; then
+	uicache -p /Applications/HappVPN.app 2>/dev/null || true
+fi
+
+exit 0

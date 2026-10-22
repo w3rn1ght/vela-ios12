@@ -1,0 +1,398 @@
+#import "HVPNTunnel.h"
+#import "HVPNConfig.h"
+#import "HVPNLinkParser.h"
+#import "HVPNRoute.h"
+
+#include <spawn.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <crt_externs.h>
+#include <SystemConfiguration/SystemConfiguration.h>
+
+static NSString *const kBaseDir = @"/var/mobile/Library/HappVPN";
+static NSString *const kConfigPath = @"/var/mobile/Library/HappVPN/core.json";
+static NSString *const kCoreLogPath = @"/var/mobile/Library/HappVPN/core.log";
+static NSString *const kCorePath = @"/usr/libexec/happvpn/sing-box";
+
+static NSArray<NSString *> *HVPNUtunNames(void) {
+    NSMutableArray *utuns = [NSMutableArray array];
+    struct if_nameindex *list = if_nameindex();
+    if (list == NULL) return utuns;
+    for (struct if_nameindex *p = list; p->if_index != 0; p++) {
+        NSString *name = [NSString stringWithUTF8String:p->if_name];
+        if (name.length && [name hasPrefix:@"utun"]) [utuns addObject:name];
+    }
+    if_freenameindex(list);
+    return utuns;
+}
+
+static NSArray<NSString *> *HVPNResolveIPv4(NSString *host) {
+    if (host.length == 0) return @[];
+    if ([host rangeOfString:@":"].location != NSNotFound) return @[]; // IPv6-литерал
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host.UTF8String, NULL, &hints, &res) != 0 || res == NULL) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+        if (p->ai_addr == NULL) continue;
+        char text[INET_ADDRSTRLEN];
+        struct sockaddr_in *sin = (struct sockaddr_in *)p->ai_addr;
+        if (inet_ntop(AF_INET, &sin->sin_addr, text, sizeof(text)) != NULL) {
+            NSString *s = [NSString stringWithUTF8String:text];
+            if (s.length && ![out containsObject:s]) [out addObject:s];
+        }
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+static BOOL HVPNIsIPv4Literal(NSString *text) {
+    if (text.length == 0) return NO;
+    struct in_addr addr;
+    return inet_pton(AF_INET, text.UTF8String, &addr) == 1;
+}
+
+// en0 (Wi-Fi) или pdp_ip0 (LTE) — тот интерфейс, через который система ходит в сеть.
+static NSString *HVPNPrimaryInterface(void) {
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("com.happvpn.daemon"), NULL, NULL);
+    if (store == NULL) return nil;
+    NSDictionary *info = CFBridgingRelease(SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/IPv4")));
+    CFRelease(store);
+    if (![info isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *name = info[@"PrimaryInterface"];
+    return [name isKindOfClass:[NSString class]] && name.length ? name : nil;
+}
+
+@implementation HVPNTunnel {
+    pid_t _pid;
+    NSString *_utun;
+    NSString *_nodeName;
+    NSString *_nodeServer;
+    NSString *_nodeType;
+    NSDate *_startedAt;
+    NSMutableArray<NSDictionary *> *_ifaceRoutes;   // {family, dst, prefix, ifindex}
+    NSMutableArray<NSArray *> *_hostRoutes;         // [family, ip, gateway]
+}
+
++ (instancetype)shared {
+    static HVPNTunnel *instance;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [HVPNTunnel new]; });
+    return instance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _ifaceRoutes = [NSMutableArray array];
+        _hostRoutes = [NSMutableArray array];
+    }
+    return self;
+}
+
+// MARK: - Очистка
+
++ (void)cleanupStaleRoutes {
+    // Если демон упал в подключённом состоянии, split-маршруты остаются в ядре
+    // и интернет пропадает. На старте сносим их (если их нет — просто игнорируем).
+    HVPNRouteDeleteInterface(AF_INET, @"0.0.0.0", 1, 0);
+    HVPNRouteDeleteInterface(AF_INET, @"128.0.0.0", 1, 0);
+    HVPNRouteDeleteInterface(AF_INET6, @"::", 1, 0);
+    HVPNRouteDeleteInterface(AF_INET6, @"8000::", 1, 0);
+}
+
+// MARK: - Публичный API
+
+- (NSDictionary *)startWithLinks:(NSArray<NSString *> *)links options:(NSDictionary *)options {
+    @synchronized (self) {
+        [self stopLocked];
+
+        if (links.count == 0) return [self failure:@"Нет ни одной ссылки"];
+
+        NSError *parseError = nil;
+        HVPNProxy *proxy = nil;
+        for (NSString *link in links) {
+            NSError *err = nil;
+            HVPNProxy *p = [HVPNLinkParser proxyFromLink:link error:&err];
+            if (p != nil) {
+                proxy = p;
+                break;
+            }
+            if (parseError == nil && err != nil) parseError = err;
+        }
+        if (proxy == nil) {
+            return [self failure:parseError.localizedDescription ?: @"Не удалось разобрать ссылку"];
+        }
+
+        // Ядру не нужен DNS, чтобы дойти до сервера: подставляем IP в outbound.
+        // Иначе получается петля «DNS идёт через прокси, адрес которого надо отрезолвить».
+        // SNI (tls.server_name) остаётся доменом — он уже прописан парсером.
+        NSArray<NSString *> *serverAddresses = HVPNResolveIPv4(proxy.server);
+        if (!HVPNIsIPv4Literal(proxy.server)) {
+            if (serverAddresses.count > 0) {
+                NSMutableDictionary *outbound = [proxy.outbound mutableCopy];
+                outbound[@"server"] = serverAddresses.firstObject;
+                proxy.outbound = outbound;
+                NSLog(@"[happvpnd] сервер %@ -> %@", proxy.server, serverAddresses.firstObject);
+            } else {
+                NSLog(@"[happvpnd] не удалось отрезолвить %@, оставляю домен", proxy.server);
+            }
+        }
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:kBaseDir withIntermediateDirectories:YES
+                       attributes:@{NSFilePosixPermissions: @0755} error:NULL];
+
+        if (![fm isExecutableFileAtPath:kCorePath]) {
+            return [self failure:[NSString stringWithFormat:@"Ядро не найдено: %@", kCorePath]];
+        }
+
+        NSMutableDictionary *opts = [options mutableCopy] ?: [NSMutableDictionary dictionary];
+        opts[@"logPath"] = kCoreLogPath;
+        NSString *primaryInterface = HVPNPrimaryInterface();
+        if (primaryInterface.length) {
+            opts[@"bindInterface"] = primaryInterface;
+            NSLog(@"[happvpnd] физический интерфейс: %@", primaryInterface);
+        } else {
+            NSLog(@"[happvpnd] не удалось определить физический интерфейс (direct пойдёт по общей таблице)");
+        }
+        NSDictionary *config = HVPNBuildConfig(proxy, opts);
+
+        NSError *jsonError = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:config
+                                                       options:NSJSONWritingPrettyPrinted
+                                                         error:&jsonError];
+        if (json == nil) {
+            return [self failure:[NSString stringWithFormat:@"Конфиг не собрался: %@",
+                                  jsonError.localizedDescription]];
+        }
+        if (![json writeToFile:kConfigPath atomically:YES]) {
+            return [self failure:@"Не удалось записать core.json"];
+        }
+        [@"" writeToFile:kCoreLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+        NSArray<NSString *> *beforeUtuns = HVPNUtunNames();
+
+        pid_t pid = [self spawnCore];
+        if (pid <= 0) {
+            return [self failure:[NSString stringWithFormat:@"Не удалось запустить ядро (errno %d)", errno]];
+        }
+
+        NSString *utun = [self waitForUtunAvoiding:beforeUtuns pid:pid timeout:12.0];
+        if (utun == nil) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, WNOHANG);
+            NSString *log = [self coreLog];
+            return [self failure:[NSString stringWithFormat:
+                                  @"Ядро не создало tun-интерфейс. Лог:\n%@",
+                                  log.length ? [self tail:log] : @"(пусто)"]];
+        }
+
+        unsigned ifindex = if_nametoindex(utun.UTF8String);
+        if (ifindex == 0) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, WNOHANG);
+            return [self failure:@"Не удалось получить индекс tun-интерфейса"];
+        }
+
+        _pid = pid;
+        _utun = utun;
+        _nodeName = proxy.name;
+        _nodeServer = proxy.server;
+        _nodeType = proxy.type;
+        _startedAt = [NSDate date];
+
+        // 1. Сервер прокси должен ходить мимо tun, иначе петля.
+        [self addHostRoutesForServerAddresses:serverAddresses];
+        // 2. Заворачиваем весь IPv4/IPv6 в tun (split default).
+        [self addInterfaceRoute:AF_INET dst:@"0.0.0.0" prefix:1 ifindex:ifindex];
+        [self addInterfaceRoute:AF_INET dst:@"128.0.0.0" prefix:1 ifindex:ifindex];
+        if (serverAddresses.count > 0) {
+            [self addInterfaceRoute:AF_INET6 dst:@"::" prefix:1 ifindex:ifindex];
+            [self addInterfaceRoute:AF_INET6 dst:@"8000::" prefix:1 ifindex:ifindex];
+        } else {
+            // Сервер доступен только по IPv6 — v6 не заворачиваем, иначе получим петлю
+            // (IPv6 host-route пока не реализован). IPv4 при этом работает как обычно.
+            NSLog(@"[happvpnd] IPv6-сервер: v6-маршруты в tun не ставлю");
+        }
+
+        if (_ifaceRoutes.count < 2) {
+            NSString *err = HVPNErrnoString();
+            [self stopLocked];
+            return [self failure:[NSString stringWithFormat:@"Не удалось поставить маршруты: %@", err]];
+        }
+
+        return @{@"ok": @YES, @"status": [self status]};
+    }
+}
+
+- (NSDictionary *)stop {
+    @synchronized (self) {
+        BOOL wasRunning = (_pid > 0);
+        [self stopLocked];
+        return @{@"ok": @YES, @"wasRunning": @(wasRunning), @"status": [self status]};
+    }
+}
+
+- (NSDictionary *)status {
+    @synchronized (self) {
+        BOOL running = (_pid > 0) && (kill(_pid, 0) == 0);
+        NSInteger uptime = 0;
+        if (running && _startedAt != nil) {
+            uptime = (NSInteger)[[NSDate date] timeIntervalSinceDate:_startedAt];
+            if (uptime < 0) uptime = 0;
+        }
+        return @{
+            @"running": @(running),
+            @"pid": @(_pid),
+            @"utun": _utun ?: @"",
+            @"node": _nodeName ?: @"",
+            @"server": _nodeServer ?: @"",
+            @"protocol": _nodeType ?: @"",
+            @"uptime": @(uptime),
+            @"routes": @(_ifaceRoutes.count)
+        };
+    }
+}
+
+- (NSString *)coreLog {
+    NSData *data = [NSData dataWithContentsOfFile:kCoreLogPath];
+    if (data.length == 0) return @"";
+    NSUInteger limit = 32 * 1024;
+    if (data.length > limit) data = [data subdataWithRange:NSMakeRange(data.length - limit, limit)];
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return text ?: @"";
+}
+
+// MARK: - Внутреннее
+
+- (NSDictionary *)failure:(NSString *)message {
+    return @{@"ok": @NO, @"error": message ?: @"Неизвестная ошибка", @"status": [self status]};
+}
+
+- (NSString *)tail:(NSString *)text {
+    if (text.length <= 4000) return text;
+    return [text substringFromIndex:text.length - 4000];
+}
+
+- (pid_t)spawnCore {
+    const char *core = kCorePath.fileSystemRepresentation;
+    const char *log = kCoreLogPath.fileSystemRepresentation;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    char *argv[] = {
+        (char *)"sing-box",
+        (char *)"run",
+        (char *)"-c",
+        (char *)kConfigPath.fileSystemRepresentation,
+        NULL
+    };
+    char **envp = *_NSGetEnviron();
+
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, core, &actions, NULL, argv, envp);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) {
+        NSLog(@"[happvpnd] posix_spawn failed: %d", rc);
+        errno = rc;
+        return -1;
+    }
+    return pid;
+}
+
+- (NSString *)waitForUtunAvoiding:(NSArray<NSString *> *)before pid:(pid_t)pid timeout:(NSTimeInterval)timeout {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    NSMutableSet *known = [NSMutableSet setWithArray:before];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        for (NSString *name in HVPNUtunNames()) {
+            if (![known containsObject:name]) return name;
+        }
+        if (kill(pid, 0) != 0) return nil;
+        usleep(100 * 1000);
+    }
+    return nil;
+}
+
+- (void)addInterfaceRoute:(int)family dst:(NSString *)dst prefix:(int)prefix ifindex:(unsigned)ifindex {
+    if (HVPNRouteAddInterface(family, dst, prefix, ifindex) == 0) {
+        [_ifaceRoutes addObject:@{@"family": @(family), @"dst": dst,
+                                  @"prefix": @(prefix), @"ifindex": @(ifindex)}];
+    } else {
+        NSLog(@"[happvpnd] route add %@/%d failed: %@", dst, prefix, HVPNErrnoString());
+    }
+}
+
+- (void)addHostRoutesForServerAddresses:(NSArray<NSString *> *)addresses {
+    if (addresses.count == 0) {
+        NSLog(@"[happvpnd] нет IP сервера для host-маршрута");
+        return;
+    }
+    NSString *gateway = nil;
+    unsigned gatewayIndex = 0;
+    if (!HVPNGetDefaultGateway(AF_INET, &gateway, &gatewayIndex)) {
+        NSLog(@"[happvpnd] default gateway не найден, полагаемся на bind_interface");
+        return;
+    }
+    for (NSString *ip in addresses) {
+        if (HVPNRouteAddHost(AF_INET, ip, gateway, gatewayIndex) == 0) {
+            [_hostRoutes addObject:@[@(AF_INET), ip, gateway]];
+        } else {
+            NSLog(@"[happvpnd] host route %@ via %@ failed: %@", ip, gateway, HVPNErrnoString());
+        }
+    }
+}
+
+- (void)stopLocked {
+    for (NSDictionary *route in [_ifaceRoutes reverseObjectEnumerator]) {
+        HVPNRouteDeleteInterface([route[@"family"] intValue],
+                                 route[@"dst"],
+                                 [route[@"prefix"] intValue],
+                                 [route[@"ifindex"] unsignedIntValue]);
+    }
+    [_ifaceRoutes removeAllObjects];
+
+    for (NSArray *host in [_hostRoutes reverseObjectEnumerator]) {
+        HVPNRouteDeleteHost([host[0] intValue], host[1], host[2], 0);
+    }
+    [_hostRoutes removeAllObjects];
+
+    if (_pid > 0) {
+        kill(_pid, SIGTERM);
+        BOOL reaped = NO;
+        for (int i = 0; i < 30; i++) {
+            pid_t r = waitpid(_pid, NULL, WNOHANG);
+            if (r == _pid || r == -1) { reaped = YES; break; }
+            usleep(100 * 1000);
+        }
+        if (!reaped) {
+            kill(_pid, SIGKILL);
+            waitpid(_pid, NULL, WNOHANG);
+        }
+    }
+
+    _pid = 0;
+    _utun = nil;
+    _nodeName = nil;
+    _nodeServer = nil;
+    _nodeType = nil;
+    _startedAt = nil;
+}
+
+@end

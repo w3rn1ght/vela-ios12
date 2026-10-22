@@ -1,0 +1,10 @@
+Package: com.happvpn.jb
+Name: HappVPN
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: VPN-клиент для jailbroken iOS 12. Поддерживает vless / vmess / trojan / shadowsocks / hysteria2 / tuic (ссылки из Happ, v2rayN, Shadowrocket и т.п.), ядро sing-box, tun-режим без NetworkExtension.
+Homepage: https://github.com/SagerNet/sing-box
+Maintainer: local
+Author: local
+Section: Networking
+Depends: firmware (>= 12.0)

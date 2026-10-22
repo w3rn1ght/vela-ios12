@@ -1,0 +1,40 @@
+name: build-deb
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  deb:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+
+      - name: Theos + ldid
+        run: |
+          brew install ldid
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/theos/sdks"
+          curl -sL -o /tmp/theos-sdks.tar.gz https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
+          tar -xzf /tmp/theos-sdks.tar.gz -C /tmp
+          cp -R /tmp/sdks-master/*.sdk "$HOME/theos/sdks/"
+
+      - name: Build sing-box core
+        run: |
+          chmod +x scripts/build-core.sh
+          ./scripts/build-core.sh
+
+      - name: Build .deb
+        run: make package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: happvpn-deb
+          path: packages/*.deb
+          if-no-files-found: error
