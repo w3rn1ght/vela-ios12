@@ -33,7 +33,7 @@ happvpnd_FILES = \
 	shared/HVPNLinkUtil.m \
 	shared/HVPNConfig.m
 
-happvpnd_FRAMEWORKS = Foundation SystemConfiguration
+happvpnd_FRAMEWORKS = Foundation
 happvpnd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
 	-I$(THEOS_PROJECT_DIR)/shared -I$(THEOS_PROJECT_DIR)/daemon
 happvpnd_INSTALL_PATH = /usr/libexec

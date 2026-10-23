@@ -16,7 +16,6 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <crt_externs.h>
-#include <SystemConfiguration/SystemConfiguration.h>
 
 static NSString *const kBaseDir = @"/var/mobile/Library/HappVPN";
 static NSString *const kConfigPath = @"/var/mobile/Library/HappVPN/core.json";
@@ -64,15 +63,16 @@ static BOOL HVPNIsIPv4Literal(NSString *text) {
     return inet_pton(AF_INET, text.UTF8String, &addr) == 1;
 }
 
-// en0 (Wi-Fi) или pdp_ip0 (LTE) — тот интерфейс, через который система ходит в сеть.
+// en0 (Wi-Fi) или pdp_ip0 (LTE) — интерфейс, через который идёт default-маршрут.
+// SystemConfiguration на iOS недоступен, поэтому берём индекс из таблицы маршрутов.
 static NSString *HVPNPrimaryInterface(void) {
-    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("com.happvpn.daemon"), NULL, NULL);
-    if (store == NULL) return nil;
-    NSDictionary *info = CFBridgingRelease(SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/IPv4")));
-    CFRelease(store);
-    if (![info isKindOfClass:[NSDictionary class]]) return nil;
-    NSString *name = info[@"PrimaryInterface"];
-    return [name isKindOfClass:[NSString class]] && name.length ? name : nil;
+    NSString *gateway = nil;
+    unsigned index = 0;
+    if (!HVPNGetDefaultGateway(AF_INET, &gateway, &index) || index == 0) return nil;
+    char name[IFNAMSIZ];
+    memset(name, 0, sizeof(name));
+    if (if_indextoname(index, name) == NULL) return nil;
+    return [NSString stringWithUTF8String:name];
 }
 
 @implementation HVPNTunnel {
