@@ -1,6 +1,6 @@
 Package: com.vela.vpn
 Name: Vela
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm
 Description: VPN-клиент для jailbroken iOS 12: vless / vmess / trojan / shadowsocks / hysteria2 / tuic, подписки с HWID, выбор сервера и пинг. Ядро sing-box, tun-режим без NetworkExtension.
 Homepage: https://github.com/w3rn1ght/vela-ios12

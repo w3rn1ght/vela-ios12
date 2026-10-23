@@ -45,8 +45,19 @@ jobs:
           vtool -show-build layout/usr/libexec/vela/sing-box || true
           echo "--- daemon ---"
           file .theos/obj/arm64/velad
-          echo "--- app ---"
-          ls -la Resources/ | head -20
+          echo "--- icons ---"
+          ls -1 .theos/_/Applications/Vela.app/*.png | wc -l
+          for f in AppIcon60x60@2x.png AppIcon60x60@3x.png Icon-Small@2x.png Icon-72@2x.png; do
+            sips -g pixelWidth -g pixelHeight ".theos/_/Applications/Vela.app/$f" 2>/dev/null | tail -2 | tr '\n' ' '
+            echo " <- $f"
+          done
+          echo "--- icon keys ---"
+          plutil -p .theos/_/Applications/Vela.app/Info.plist | grep -i -E "icon" || true
+          if plutil -p .theos/_/Applications/Vela.app/Info.plist | grep -q CFBundleIconName; then
+            echo "ERROR: CFBundleIconName присутствует — iOS 12 будет искать Assets.car и иконка станет пустой"
+            exit 1
+          fi
+          echo "CFBundleIconName отсутствует: ok"
           echo "--- deb ---"
           ls -lh packages/
           dpkg-deb -I packages/*.deb 2>/dev/null || true

@@ -5,7 +5,8 @@ import pathlib
 import struct
 import zlib
 
-OUT = pathlib.Path(r"C:\Users\Artem\Documents\Проект по умолчанию\happvpn-ios12\Resources")
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "Resources"
 SIZE = 1024
 SS = 2  # supersampling
 
@@ -125,17 +126,29 @@ def main():
     base = render()
 
     targets = {
+        # iPhone
+        "AppIcon60x60.png": 60,
         "AppIcon60x60@2x.png": 120,
         "AppIcon60x60@3x.png": 180,
-        "AppIcon60x60.png": 60,
-        "AppIcon76x76.png": 76,
-        "AppIcon76x76@2x.png": 152,
+        "Icon-60.png": 60,
+        "Icon-60@2x.png": 120,
+        "Icon-60@3x.png": 180,
+        "Icon-Small.png": 29,
+        "Icon-Small@2x.png": 58,
+        "Icon-Small@3x.png": 87,
         "Icon-40.png": 40,
         "Icon-40@2x.png": 80,
         "Icon-40@3x.png": 120,
-        "Icon-60@2x.png": 120,
-        "Icon-60@3x.png": 180,
+        # iPad
+        "AppIcon76x76.png": 76,
+        "AppIcon76x76@2x.png": 152,
+        "AppIcon83.5x83.5@2x.png": 167,
+        "Icon-72.png": 72,
+        "Icon-72@2x.png": 144,
+        "Icon-76.png": 76,
+        "Icon-76@2x.png": 152,
         "Icon-83.5@2x.png": 167,
+        # иконка для App Store / настроек
         "AppIcon1024.png": 1024,
     }
     for name, size in targets.items():

@@ -34,9 +34,15 @@ launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
 launchctl load "$DAEMON_PLIST" 2>/dev/null || true
 
 if [ -x /usr/bin/uicache ]; then
+	# -a перестраивает весь кеш иконок: иначе SpringBoard может держать
+	# закешированную «пустую» иконку от предыдущей версии.
 	uicache -p /Applications/Vela.app 2>/dev/null || true
+	uicache -a 2>/dev/null || true
 elif [ -x /usr/bin/uicache-legacy ]; then
 	uicache-legacy 2>/dev/null || true
 fi
+
+# Сбросить кеш SpringBoard, чтобы новая иконка применилась сразу.
+killall -9 SpringBoard 2>/dev/null || true
 
 exit 0
