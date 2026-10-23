@@ -1,4 +1,5 @@
 #import "HVPNRoute.h"
+#import "HVPNRouteCompat.h"
 
 #include <errno.h>
 #include <string.h>
@@ -7,8 +8,6 @@
 #include <sys/sysctl.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
-#include <net/if_dl.h>
-#include <net/route.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -26,14 +25,14 @@ static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
     char buf[512];
     memset(buf, 0, sizeof(buf));
 
-    struct rt_msghdr *rtm = (struct rt_msghdr *)buf;
-    char *cp = buf + sizeof(struct rt_msghdr);
-    int len = (int)sizeof(struct rt_msghdr);
+    struct hvpn_rt_msghdr *rtm = (struct hvpn_rt_msghdr *)buf;
+    char *cp = buf + sizeof(struct hvpn_rt_msghdr);
+    int len = (int)sizeof(struct hvpn_rt_msghdr);
 
-    rtm->rtm_version = RTM_VERSION;
+    rtm->rtm_version = HVPN_RTM_VERSION;
     rtm->rtm_type = (u_char)cmd;
-    rtm->rtm_flags = RTF_UP | RTF_STATIC;
-    rtm->rtm_addrs = RTA_DST | RTA_NETMASK | RTA_GATEWAY;
+    rtm->rtm_flags = HVPN_RTF_UP | HVPN_RTF_STATIC;
+    rtm->rtm_addrs = HVPN_RTA_DST | HVPN_RTA_NETMASK | HVPN_RTA_GATEWAY;
 
     if (family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)cp;
@@ -97,17 +96,17 @@ static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
             len += (int)sizeof(struct sockaddr_in6);
         }
     } else {
-        struct sockaddr_dl *sdl = (struct sockaddr_dl *)cp;
-        sdl->sdl_len = sizeof(struct sockaddr_dl);
+        struct hvpn_sockaddr_dl *sdl = (struct hvpn_sockaddr_dl *)cp;
+        memset(sdl, 0, sizeof(*sdl));
+        sdl->sdl_len = sizeof(struct hvpn_sockaddr_dl);
         sdl->sdl_family = AF_LINK;
-        sdl->sdl_index = (unsigned short)ifindex;
-        sdl->sdl_nlen = 0;
-        cp += sizeof(struct sockaddr_dl);
-        len += (int)sizeof(struct sockaddr_dl);
+        sdl->sdl_index = (u_short)ifindex;
+        cp += sizeof(struct hvpn_sockaddr_dl);
+        len += (int)sizeof(struct hvpn_sockaddr_dl);
     }
 
     rtm->rtm_msglen = (u_short)len;
-    rtm->rtm_index = (unsigned short)ifindex;
+    rtm->rtm_index = (u_short)ifindex;
 
     ssize_t rc;
     do {
@@ -131,25 +130,25 @@ static BOOL HVPNParseAddr(int family, NSString *text, uint8_t out[16]) {
 int HVPNRouteAddInterface(int family, NSString *dst, int prefix, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(RTM_ADD, family, addr, prefix, ifindex, nil);
+    return HVPNRouteOp(HVPN_RTM_ADD, family, addr, prefix, ifindex, nil);
 }
 
 int HVPNRouteDeleteInterface(int family, NSString *dst, int prefix, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(RTM_DELETE, family, addr, prefix, ifindex, nil);
+    return HVPNRouteOp(HVPN_RTM_DELETE, family, addr, prefix, ifindex, nil);
 }
 
 int HVPNRouteAddHost(int family, NSString *dst, NSString *gateway, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(RTM_ADD, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
+    return HVPNRouteOp(HVPN_RTM_ADD, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
 }
 
 int HVPNRouteDeleteHost(int family, NSString *dst, NSString *gateway, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(RTM_DELETE, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
+    return HVPNRouteOp(HVPN_RTM_DELETE, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
 }
 
 BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {
@@ -170,22 +169,22 @@ BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {
 
     char *p = buf;
     char *end = buf + needed;
-    while (p + sizeof(struct rt_msghdr) <= end) {
-        struct rt_msghdr *rtm = (struct rt_msghdr *)p;
+    while (p + sizeof(struct hvpn_rt_msghdr) <= end) {
+        struct hvpn_rt_msghdr *rtm = (struct hvpn_rt_msghdr *)p;
         if (rtm->rtm_msglen == 0) break;
         p += rtm->rtm_msglen;
 
-        if (rtm->rtm_type != RTM_GET) continue;
-        if (!(rtm->rtm_flags & RTF_GATEWAY)) continue;
+        if (rtm->rtm_type != HVPN_RTM_GET) continue;
+        if (!(rtm->rtm_flags & HVPN_RTF_GATEWAY)) continue;
 
         struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
         struct sockaddr *dstSA = NULL, *gwSA = NULL, *maskSA = NULL;
-        for (int i = 1; i <= RTAX_MAX; i++) {
+        for (int i = 1; i <= HVPN_RTAX_MAX; i++) {
             if (!(rtm->rtm_addrs & (1 << (i - 1)))) continue;
             if (sa->sa_len == 0) break;
-            if (i == RTAX_DST) dstSA = sa;
-            if (i == RTAX_GATEWAY) gwSA = sa;
-            if (i == RTAX_NETMASK) maskSA = sa;
+            if (i == 1) dstSA = sa;         // RTA_DST
+            if (i == 2) gwSA = sa;          // RTA_GATEWAY
+            if (i == 4) maskSA = sa;        // RTA_NETMASK
             sa = (struct sockaddr *)((char *)sa + HVPN_ROUNDUP(sa->sa_len));
         }
         if (dstSA == NULL || gwSA == NULL) continue;
@@ -200,11 +199,8 @@ BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {
             isDefault = IN6_IS_ADDR_UNSPECIFIED(&d->sin6_addr);
         }
         if (!isDefault) continue;
-        if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in)) {
-            uint32_t m = 0;
-            if (family == AF_INET) m = ((struct sockaddr_in *)maskSA)->sin_addr.s_addr;
-            else m = 0;
-            if (m != 0) continue;
+        if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in) && family == AF_INET) {
+            if (((struct sockaddr_in *)maskSA)->sin_addr.s_addr != 0) continue;
         }
 
         char text[INET6_ADDRSTRLEN];
@@ -217,7 +213,7 @@ BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {
             resultIndex = rtm->rtm_index;
             found = YES;
         }
-        if (found) break;
+        break;
     }
 
     free(buf);
