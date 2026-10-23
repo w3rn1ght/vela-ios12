@@ -312,7 +312,7 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
     }
 }
 
-- (void)fetchURLs:(NSArray<NSString *> *)urls
+- (void)fetchURLs:(NSMutableArray<NSString *> *)urls
             index:(NSUInteger)index
             found:(NSMutableArray<NSString *> *)found
      placeholders:(NSUInteger *)placeholders {
