@@ -71,15 +71,16 @@ int main(void) {
         expect([trojan.outbound[@"transport"][@"service_name"] isEqualToString:@"GunService"], @"grpc service");
 
         printf("shadowsocks (sip002)\n");
-        NSString *credentials = [@"aes-256-gcm:pass word" dataUsingEncoding:NSUTF8StringEncoding]
-            .base64EncodedString;
+        NSData *credData = [@"aes-256-gcm:pass word" dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *credentials = [credData base64EncodedStringWithOptions:0];
         HVPNProxy *ss = parse([NSString stringWithFormat:@"ss://%@@ss.example.com:8388#ss-node", credentials]);
         expect([ss.outbound[@"method"] isEqualToString:@"aes-256-gcm"], @"method");
         expect([ss.outbound[@"password"] isEqualToString:@"pass word"], @"password with space");
 
         printf("shadowsocks (legacy, whole body base64)\n");
-        NSString *legacy = [@"chacha20-ietf-poly1305:pw@ss2.example.com:8389"
-            dataUsingEncoding:NSUTF8StringEncoding].base64EncodedString;
+        NSData *legacyData = [@"chacha20-ietf-poly1305:pw@ss2.example.com:8389"
+            dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *legacy = [legacyData base64EncodedStringWithOptions:0];
         HVPNProxy *ss2 = parse([@"ss://" stringByAppendingString:legacy]);
         expect([ss2.outbound[@"server"] isEqualToString:@"ss2.example.com"], @"legacy host");
         expect(ss2.port == 8389, @"legacy port");
