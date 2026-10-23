@@ -14,6 +14,7 @@ extern NSString *const HVPNVersionString;
 ///   dnsRemote     NSString — DoH/DoT для прокси (default https://1.1.1.1/dns-query)
 ///   dnsLocal      NSString — DNS для direct (default 223.5.5.5)
 ///   mtu           NSNumber (default 1500)
+///   interfaceName NSString — имя tun, ОБЯЗАТЕЛЬНО "utun<N>" (sing-tun парсит номер)
 ///   logLevel      NSString (default info)
 ///   logPath       NSString — файл лога ядра
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *_Nullable options);

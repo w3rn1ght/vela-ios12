@@ -308,6 +308,11 @@ static NSString *HVPNPingText(HVPNNode *node) {
     [refresh addTarget:self action:@selector(refreshSubscription) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:refresh];
 
+    UIButton *routes = [UIButton buttonWithType:UIButtonTypeSystem];
+    [routes setTitle:@"Сбросить маршруты (если пропал интернет)" forState:UIControlStateNormal];
+    [routes addTarget:self action:@selector(resetRoutes) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:routes];
+
     _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleGray];
     _spinner.hidesWhenStopped = YES;
     [stack addArrangedSubview:_spinner];
@@ -352,6 +357,21 @@ static NSString *HVPNPingText(HVPNNode *node) {
     [HVPNStore resetHWID];
     _hwidLabel.text = [NSString stringWithFormat:@"текущий: %@", [HVPNStore currentHWID]];
     _statusLabel.text = @"Сгенерирован новый HWID. Нажмите «Обновить подписку».";
+}
+
+- (void)resetRoutes {
+    _statusLabel.text = @"Снимаю оставшиеся маршруты…";
+    __weak HVPNSettingsViewController *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *response = HVPNSend(@{@"cmd": @"cleanup"}, NULL, 20);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            HVPNSettingsViewController *strongSelf = weakSelf;
+            if (strongSelf == nil) return;
+            strongSelf->_statusLabel.text = response
+                ? @"Маршруты сброшены. Проверьте интернет (Safari)."
+                : @"Демон не отвечает — маршруты не сброшены.";
+        });
+    });
 }
 
 - (void)refreshSubscription {

@@ -90,6 +90,10 @@ static NSDictionary *HVPNHandleRequest(NSDictionary *request) {
         result[@"version"] = HVPNVersionString;
         return result;
     }
+    if ([cmd isEqualToString:@"cleanup"]) {
+        [HVPNTunnel cleanupStaleRoutes];
+        return @{@"ok": @YES, @"version": HVPNVersionString, @"status": [tunnel status]};
+    }
     if ([cmd isEqualToString:@"log"]) {
         return @{@"ok": @YES, @"log": [tunnel coreLog], @"status": [tunnel status]};
     }

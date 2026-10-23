@@ -6,6 +6,7 @@
 
 #include <spawn.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -17,6 +18,7 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netdb.h>
 #include <crt_externs.h>
 
@@ -66,6 +68,17 @@ static BOOL HVPNIsIPv4Literal(NSString *text) {
     return inet_pton(AF_INET, text.UTF8String, &addr) == 1;
 }
 
+// Следующее свободное имя utun: sing-tun на Darwin берёт номер из имени
+// ("utun4" -> юнит 5) и падает, если номер уже занят.
+static NSString *HVPNNextTunName(void) {
+    NSInteger maxIndex = -1;
+    for (NSString *name in HVPNUtunNames()) {
+        NSInteger index = [[name substringFromIndex:@"utun".length] integerValue];
+        if (index > maxIndex) maxIndex = index;
+    }
+    return [NSString stringWithFormat:@"utun%ld", (long)(maxIndex + 1)];
+}
+
 // en0 (Wi-Fi) или pdp_ip0 (LTE) — интерфейс, через который идёт default-маршрут.
 // SystemConfiguration на iOS недоступен, поэтому берём индекс из таблицы маршрутов.
 static NSString *HVPNPrimaryInterface(void) {
@@ -113,11 +126,26 @@ static NSString *HVPNPrimaryInterface(void) {
 
 + (void)cleanupStaleRoutes {
     // Если демон упал в подключённом состоянии, split-маршруты остаются в ядре
-    // и интернет пропадает. На старте сносим их (если их нет — просто игнорируем).
-    HVPNRouteDeleteInterface(AF_INET, @"0.0.0.0", 1, 0);
-    HVPNRouteDeleteInterface(AF_INET, @"128.0.0.0", 1, 0);
-    HVPNRouteDeleteInterface(AF_INET6, @"::", 1, 0);
-    HVPNRouteDeleteInterface(AF_INET6, @"8000::", 1, 0);
+    // и интернет пропадает. Удаляем их с РЕАЛЬНЫМ индексом интерфейса:
+    // с ifindex 0 ядро такой маршрут не находит и он остаётся навсегда.
+    NSArray *routes = @[
+        @[@(AF_INET), @"0.0.0.0", @1],
+        @[@(AF_INET), @"128.0.0.0", @1],
+        @[@(AF_INET6), @"::", @1],
+        @[@(AF_INET6), @"8000::", @1]
+    ];
+    for (NSArray *route in routes) {
+        int family = [route[0] intValue];
+        NSString *dst = route[1];
+        int prefix = [route[2] intValue];
+        unsigned index = HVPNRouteInterfaceIndex(family, dst, prefix);
+        if (index == 0) continue;   // маршрута нет — и хорошо
+        if (HVPNRouteDeleteInterface(family, dst, prefix, index) == 0) {
+            NSLog(@"[velad] снят оставшийся маршрут %@/%d (ifindex %u)", dst, prefix, index);
+        } else {
+            NSLog(@"[velad] не удалось снять %@/%d: %@", dst, prefix, HVPNErrnoString());
+        }
+    }
 }
 
 // MARK: - Публичный API
@@ -189,6 +217,9 @@ static NSString *HVPNPrimaryInterface(void) {
 
         NSMutableDictionary *opts = [options mutableCopy] ?: [NSMutableDictionary dictionary];
         opts[@"logPath"] = kCoreLogPath;
+        NSString *tunName = HVPNNextTunName();
+        opts[@"interfaceName"] = tunName;
+        NSLog(@"[velad] tun: %@", tunName);
         NSString *primaryInterface = HVPNPrimaryInterface();
         if (primaryInterface.length) {
             opts[@"bindInterface"] = primaryInterface;
@@ -218,13 +249,14 @@ static NSString *HVPNPrimaryInterface(void) {
             return [self failure:[NSString stringWithFormat:@"Не удалось запустить ядро (errno %d)", errno]];
         }
 
-        NSString *utun = [self waitForUtunAvoiding:beforeUtuns pid:pid timeout:12.0];
+        NSString *utun = [self waitForTunNamed:tunName pid:pid timeout:15.0];
         if (utun == nil) {
             kill(pid, SIGKILL);
             waitpid(pid, NULL, WNOHANG);
             NSString *log = [self coreLog];
             return [self failure:[NSString stringWithFormat:
-                                  @"Ядро не создало tun-интерфейс. Лог:\n%@",
+                                  @"Ядро не создало tun-интерфейс %@ (занятых utun: %lu). Лог:\n%@",
+                                  tunName, (unsigned long)beforeUtuns.count,
                                   log.length ? [self tail:log] : @"(пусто)"]];
         }
 
@@ -277,6 +309,15 @@ static NSString *HVPNPrimaryInterface(void) {
 - (NSDictionary *)status {
     @synchronized (self) {
         BOOL running = (_pid > 0) && (kill(_pid, 0) == 0);
+        // Самовосстановление: если ядро не запущено, а split-маршруты остались
+        // (прошлый запуск умер), интернета нет вообще. Снимаем их.
+        if (!running) {
+            unsigned stale = HVPNRouteInterfaceIndex(AF_INET, @"0.0.0.0", 1);
+            if (stale != 0) {
+                NSLog(@"[velad] найдены оставшиеся маршруты (ifindex %u), снимаю", stale);
+                [HVPNTunnel cleanupStaleRoutes];
+            }
+        }
         NSInteger uptime = 0;
         if (running && _startedAt != nil) {
             uptime = (NSInteger)[[NSDate date] timeIntervalSinceDate:_startedAt];
@@ -345,14 +386,11 @@ static NSString *HVPNPrimaryInterface(void) {
     return pid;
 }
 
-- (NSString *)waitForUtunAvoiding:(NSArray<NSString *> *)before pid:(pid_t)pid timeout:(NSTimeInterval)timeout {
+- (NSString *)waitForTunNamed:(NSString *)name pid:(pid_t)pid timeout:(NSTimeInterval)timeout {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-    NSMutableSet *known = [NSMutableSet setWithArray:before];
     while ([deadline timeIntervalSinceNow] > 0) {
-        for (NSString *name in HVPNUtunNames()) {
-            if (![known containsObject:name]) return name;
-        }
-        if (kill(pid, 0) != 0) return nil;
+        if (if_nametoindex(name.UTF8String) != 0) return name;
+        if (kill(pid, 0) != 0) return nil;   // ядро упало
         usleep(100 * 1000);
     }
     return nil;
@@ -430,7 +468,9 @@ static NSString *HVPNPrimaryInterface(void) {
 #endif
 
 static double HVPNNow(void) {
-    return CFAbsoluteTimeGetCurrent() * 1000.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000000.0 + (double)ts.tv_nsec / 1000.0;   // микросекунды
 }
 
 static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
@@ -464,10 +504,10 @@ static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
 
     double started = HVPNNow();
     int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-    NSInteger elapsed = -1;
+    NSInteger elapsedUs = -1;
 
     if (rc == 0) {
-        elapsed = (NSInteger)llround(HVPNNow() - started);
+        elapsedUs = (NSInteger)llround(HVPNNow() - started);
     } else if (errno == EINPROGRESS) {
         struct pollfd pfd;
         pfd.fd = fd;
@@ -478,7 +518,7 @@ static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
             int soError = 0;
             socklen_t length = sizeof(soError);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &length) == 0 && soError == 0) {
-                elapsed = (NSInteger)llround(HVPNNow() - started);
+                elapsedUs = (NSInteger)llround(HVPNNow() - started);
             } else if (errorText) {
                 *errorText = [NSString stringWithUTF8String:strerror(soError)] ?: @"connect failed";
             }
@@ -492,7 +532,8 @@ static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
     }
 
     close(fd);
-    return elapsed;
+    // Микросекунды: 0 или отрицательное — не валидный замер.
+    return elapsedUs > 0 ? elapsedUs : -1;
 }
 
 - (NSDictionary *)pingServer:(NSString *)server port:(NSInteger)port {
@@ -516,11 +557,11 @@ static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
     }
 
     NSString *lastError = nil;
-    NSMutableArray<NSNumber *> *samples = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *samples = [NSMutableArray array];   // микросекунды
     for (int attempt = 0; attempt < 3; attempt++) {
         NSString *error = nil;
-        NSInteger ms = HVPNPingOnce(addresses.firstObject, port, ifindex, 3.0, &error);
-        if (ms >= 0) [samples addObject:@(ms)];
+        NSInteger us = HVPNPingOnce(addresses.firstObject, port, ifindex, 3.0, &error);
+        if (us > 0) [samples addObject:@(us)];
         else if (error.length) lastError = error;
         if (attempt < 2) usleep(120 * 1000);
     }
@@ -528,11 +569,15 @@ static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
     if (samples.count == 0) {
         return @{@"ok": @NO,
                  @"error": lastError.length ? lastError : @"нет ответа",
+                 @"ip": addresses.firstObject,
                  @"attempts": @[]};
     }
     NSArray *sorted = [samples sortedArrayUsingSelector:@selector(compare:)];
-    NSInteger median = [sorted[sorted.count / 2] integerValue];
-    return @{@"ok": @YES, @"ms": @(median), @"attempts": sorted};
+    double medianUs = [sorted[sorted.count / 2] doubleValue];
+    // Округляем вверх: 0 мс в интерфейсе выглядит как баг, а не как «быстро».
+    NSInteger ms = (NSInteger)ceil(medianUs / 1000.0);
+    if (ms < 1) ms = 1;
+    return @{@"ok": @YES, @"ms": @(ms), @"ip": addresses.firstObject, @"attempts": sorted};
 }
 
 @end

@@ -14,6 +14,9 @@ int HVPNRouteDeleteHost(int family, NSString *dst, NSString *gateway, unsigned i
 /// Шлюз по умолчанию (например 192.168.1.1) и индекс его интерфейса.
 BOOL HVPNGetDefaultGateway(int family, NSString *_Nullable *_Nullable gateway, unsigned *_Nullable ifindex);
 
+/// Индекс интерфейса, через который идёт маршрут dst/prefix (0 — не найден).
+unsigned HVPNRouteInterfaceIndex(int family, NSString *dst, int prefix);
+
 /// Текст последней ошибки (errno), для логов.
 NSString *HVPNErrnoString(void);
 

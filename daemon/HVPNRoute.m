@@ -222,3 +222,78 @@ BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {
     if (ifindex) *ifindex = resultIndex;
     return YES;
 }
+
+unsigned HVPNRouteInterfaceIndex(int family, NSString *dst, int prefix) {
+    int mib[6] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_DUMP, 0};
+    size_t needed = 0;
+    if (sysctl(mib, 6, NULL, &needed, NULL, 0) < 0 || needed == 0) return 0;
+
+    char *buf = malloc(needed);
+    if (buf == NULL) return 0;
+    if (sysctl(mib, 6, buf, &needed, NULL, 0) < 0) {
+        free(buf);
+        return 0;
+    }
+
+    uint8_t wanted[16];
+    if (!HVPNParseAddr(family, dst, wanted)) {
+        free(buf);
+        return 0;
+    }
+
+    unsigned result = 0;
+    char *p = buf;
+    char *end = buf + needed;
+    while (p + sizeof(struct hvpn_rt_msghdr) <= end) {
+        struct hvpn_rt_msghdr *rtm = (struct hvpn_rt_msghdr *)p;
+        if (rtm->rtm_msglen == 0) break;
+        p += rtm->rtm_msglen;
+
+        if (rtm->rtm_type != HVPN_RTM_GET) continue;
+        if (rtm->rtm_flags & HVPN_RTF_GATEWAY) continue;   // нам нужен маршрут «в интерфейс»
+
+        struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
+        struct sockaddr *dstSA = NULL, *maskSA = NULL;
+        for (int i = 1; i <= HVPN_RTAX_MAX; i++) {
+            if (!(rtm->rtm_addrs & (1 << (i - 1)))) continue;
+            if (sa->sa_len == 0) break;
+            if (i == 1) dstSA = sa;
+            if (i == 4) maskSA = sa;
+            sa = (struct sockaddr *)((char *)sa + HVPN_ROUNDUP(sa->sa_len));
+        }
+        if (dstSA == NULL || dstSA->sa_family != family) continue;
+
+        const void *addr = (family == AF_INET)
+            ? (const void *)&((struct sockaddr_in *)dstSA)->sin_addr
+            : (const void *)&((struct sockaddr_in6 *)dstSA)->sin6_addr;
+        size_t size = (family == AF_INET) ? 4 : 16;
+        if (memcmp(addr, wanted, size) != 0) continue;
+
+        // Проверяем маску, иначе можно поймать другой маршрут с тем же адресом.
+        if (family == AF_INET) {
+            uint32_t mask = 0;
+            if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in))
+                mask = ntohl(((struct sockaddr_in *)maskSA)->sin_addr.s_addr);
+            uint32_t want = (prefix <= 0) ? 0 : (0xFFFFFFFFu << (32 - prefix));
+            if (mask != want) continue;
+        } else {
+            uint8_t mask[16];
+            memset(mask, 0, sizeof(mask));
+            if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in6))
+                memcpy(mask, &((struct sockaddr_in6 *)maskSA)->sin6_addr, 16);
+            int full = prefix / 8;
+            for (int i = 0; i < 16; i++) {
+                uint8_t want = i < full ? 0xFF : (i == full && prefix % 8 ? (uint8_t)(0xFF << (8 - prefix % 8)) : 0);
+                if (mask[i] != want) { result = 0; goto next; }
+            }
+        }
+
+        result = rtm->rtm_index;
+        break;
+    next:
+        continue;
+    }
+
+    free(buf);
+    return result;
+}

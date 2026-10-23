@@ -1,6 +1,6 @@
 #import "HVPNConfig.h"
 
-NSString *const HVPNVersionString = @"0.2.2";
+NSString *const HVPNVersionString = @"0.2.3";
 
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *opts = options ?: @{};
@@ -54,6 +54,10 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *inbound = @{
         @"type": @"tun",
         @"tag": @"tun-in",
+        // sing-tun на Darwin требует имя вида utun<N> и парсит из него номер юнита.
+        // Без явного имени sing-box при GOOS=ios подставляет "tun0" и падает
+        // с "bad tun name: tun0".
+        @"interface_name": opts[@"interfaceName"] ?: @"utun4",
         // Поля именно для sing-box 1.8.x (в 1.10+ они заменены на "address").
         @"inet4_address": @"172.19.0.1/30",
         @"inet6_address": @"fdfe:dcba:9876::1/126",
