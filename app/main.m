@@ -257,7 +257,7 @@ static NSString *HVPNPingText(HVPNNode *node) {
     self.title = @"Настройки";
     self.view.backgroundColor = [UIColor groupTableViewBackgroundColor];
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonItemStyleDone
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                                                       target:self action:@selector(close)];
 
     UIScrollView *scroll = [UIScrollView new];
