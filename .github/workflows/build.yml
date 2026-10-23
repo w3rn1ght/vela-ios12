@@ -41,10 +41,12 @@ jobs:
       - name: Inspect binaries
         run: |
           echo "--- core ---"
-          file layout/usr/libexec/happvpn/sing-box
-          vtool -show-build layout/usr/libexec/happvpn/sing-box || true
+          file layout/usr/libexec/vela/sing-box
+          vtool -show-build layout/usr/libexec/vela/sing-box || true
           echo "--- daemon ---"
-          file .theos/obj/arm64/happvpnd
+          file .theos/obj/arm64/velad
+          echo "--- app ---"
+          ls -la Resources/ | head -20
           echo "--- deb ---"
           ls -lh packages/
           dpkg-deb -I packages/*.deb 2>/dev/null || true
@@ -52,6 +54,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: happvpn-deb
+          name: vela-deb
           path: packages/*.deb
           if-no-files-found: error
