@@ -15,7 +15,8 @@ HappVPN_FILES = \
 	shared/HVPNConfig.m
 
 HappVPN_FRAMEWORKS = UIKit Foundation
-HappVPN_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+HappVPN_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
+	-I$(THEOS_PROJECT_DIR)/shared -I$(THEOS_PROJECT_DIR)/daemon
 HappVPN_CODESIGN_FLAGS = -Sentitlements/app.plist
 
 include $(THEOS_MAKE_PATH)/application.mk
@@ -33,7 +34,8 @@ happvpnd_FILES = \
 	shared/HVPNConfig.m
 
 happvpnd_FRAMEWORKS = Foundation SystemConfiguration
-happvpnd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+happvpnd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
+	-I$(THEOS_PROJECT_DIR)/shared -I$(THEOS_PROJECT_DIR)/daemon
 happvpnd_INSTALL_PATH = /usr/libexec
 happvpnd_CODESIGN_FLAGS = -Sentitlements/daemon.plist
 
