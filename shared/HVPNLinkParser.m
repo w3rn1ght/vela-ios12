@@ -614,9 +614,9 @@ static NSString *HVPNNodeName(NSString *fragment, NSString *host, NSInteger port
             port = HVPNStr(server[@"port"]).integerValue;
             NSString *method = HVPNStr(server[@"method"]) ?: @"";
             NSString *password = HVPNStr(server[@"password"]) ?: @"";
-            NSString *credentials = [[NSString stringWithFormat:@"%@:%@", method, password]
-                                     dataUsingEncoding:NSUTF8StringEncoding]
-                                     .base64EncodedStringWithOptions:0;
+            NSData *credentialData = [[NSString stringWithFormat:@"%@:%@", method, password]
+                                      dataUsingEncoding:NSUTF8StringEncoding];
+            NSString *credentials = [credentialData base64EncodedStringWithOptions:0];
             NSString *hostPart = [hostText rangeOfString:@":"].location != NSNotFound
                 ? [NSString stringWithFormat:@"[%@]", hostText] : hostText;
             [links addObject:[NSString stringWithFormat:@"ss://%@@%@:%ld#%@",
