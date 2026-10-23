@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
+#include <sys/utsname.h>
 
 static NSString *const kSocketPath = @"/var/mobile/Library/HappVPN/control.sock";
 static NSString *const kLinksDefaultsKey = @"HappVPNLinks";
@@ -120,6 +121,81 @@ static NSString *HVPNTrim(NSString *s) {
     return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
+// Панели (Remnawave и совместимые) привязывают подписку к устройству по заголовку
+// x-hwid: без него вместо нод отдают заглушки 0.0.0.0:1 с просьбой «включить HWID».
+// Идентификатор генерируется один раз и живёт в NSUserDefaults.
+static NSString *HVPNHWID(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *hwid = [defaults stringForKey:@"HappVPNHWID"];
+    if (hwid.length == 0) {
+        hwid = [[NSUUID UUID] UUIDString];
+        [defaults setObject:hwid forKey:@"HappVPNHWID"];
+        [defaults synchronize];
+    }
+    return hwid;
+}
+
+static NSString *HVPNDeviceModel(void) {
+    struct utsname info;
+    if (uname(&info) == 0) {
+        NSString *machine = [NSString stringWithUTF8String:info.machine];
+        if (machine.length) return machine;
+    }
+    return @"iPhone";
+}
+
+static NSString *HVPNLastSubscriptionInfo = nil;
+
+static NSString *HVPNFormatBytes(long long bytes) {
+    if (bytes <= 0) return @"0";
+    double value = (double)bytes;
+    NSArray<NSString *> *units = @[@"Б", @"КБ", @"МБ", @"ГБ", @"ТБ"];
+    NSUInteger index = 0;
+    while (value >= 1024.0 && index + 1 < units.count) {
+        value /= 1024.0;
+        index++;
+    }
+    return [NSString stringWithFormat:@"%.1f %@", value, units[index]];
+}
+
+// subscription-userinfo: upload=0; download=16145860601; total=0; expire=1795938367
+static NSString *HVPNFormatUserinfo(NSString *raw) {
+    if (raw.length == 0) return nil;
+    long long download = 0, total = 0, expire = 0;
+    for (NSString *part in [raw componentsSeparatedByString:@";"]) {
+        NSString *pair = HVPNTrim(part);
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *key = [pair substringToIndex:eq.location];
+        long long value = [pair substringFromIndex:eq.location + 1].longLongValue;
+        if ([key isEqualToString:@"download"]) download = value;
+        else if ([key isEqualToString:@"total"]) total = value;
+        else if ([key isEqualToString:@"expire"]) expire = value;
+    }
+    NSMutableString *text = [NSMutableString stringWithFormat:@"Трафик: %@", HVPNFormatBytes(download)];
+    [text appendFormat:(total > 0 ? @" / %@" : @" (без лимита)"), total > 0 ? HVPNFormatBytes(total) : @""];
+    if (expire > 0) {
+        NSDateFormatter *formatter = [NSDateFormatter new];
+        formatter.dateFormat = @"dd.MM.yyyy";
+        [text appendFormat:@", до %@", [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:expire]]];
+    }
+    return text;
+}
+
+static NSURLRequest *HVPNSubscriptionRequest(NSURL *url) {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    // Панели выбирают формат ответа по User-Agent: для v2ray-совместимых клиентов
+    // отдают обычный base64-список ссылок, для Happ — свой JSON.
+    [request setValue:@"v2rayNG/1.8.5" forHTTPHeaderField:@"User-Agent"];
+    [request setValue:HVPNHWID() forHTTPHeaderField:@"x-hwid"];
+    [request setValue:@"iOS" forHTTPHeaderField:@"x-device-os"];
+    [request setValue:[[UIDevice currentDevice] systemVersion] forHTTPHeaderField:@"x-ver-os"];
+    [request setValue:HVPNDeviceModel() forHTTPHeaderField:@"x-device-model"];
+    [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+    request.timeoutInterval = 30;
+    return request;
+}
+
 static void HVPNCollectLinks(NSString *text,
                             NSUInteger depth,
                             void (^completion)(NSArray<NSString *> *links, NSError *error));
@@ -138,8 +214,14 @@ static void HVPNFetchSubscriptions(NSArray<NSString *> *urls,
         return;
     }
     NSURLSessionDataTask *task = [[NSURLSession sharedSession]
-        dataTaskWithURL:url
-      completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dataTaskWithRequest:HVPNSubscriptionRequest(url)
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSString *userinfo = [(NSHTTPURLResponse *)response allHeaderFields][@"subscription-userinfo"];
+            if ([userinfo isKindOfClass:[NSString class]] && userinfo.length) {
+                HVPNLastSubscriptionInfo = userinfo;
+            }
+        }
         NSMutableArray<NSString *> *found = [NSMutableArray array];
         if (data.length) {
             NSArray<NSString *> *parsed = [HVPNLinkParser linksFromSubscriptionData:data];
@@ -165,6 +247,7 @@ static void HVPNCollectLinks(NSString *text,
                             void (^completion)(NSArray<NSString *> *links, NSError *error)) {
     NSMutableArray<NSString *> *links = [NSMutableArray array];
     NSMutableArray<NSString *> *urls = [NSMutableArray array];
+    NSUInteger placeholders = 0;
 
     for (NSString *line in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
         NSString *t = HVPNTrim(line);
@@ -172,17 +255,33 @@ static void HVPNCollectLinks(NSString *text,
         NSString *lower = t.lowercaseString;
         if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"]) {
             [urls addObject:t];
+        } else if ([HVPNLinkParser isPlaceholderLink:t]) {
+            placeholders++;
         } else {
             [links addObject:t];
         }
     }
 
     if (urls.count == 0 || depth > 1) {
+        if (links.count == 0 && placeholders > 0) {
+            completion(links, [NSError errorWithDomain:@"com.happvpn.app" code:1
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                @"Сервер отдал только заглушки (0.0.0.0:1) вместо нод. Обычно это значит, "
+                @"что подписка не активирована/истекла или исчерпан лимит устройств."}]);
+            return;
+        }
         completion(links, nil);
         return;
     }
 
     HVPNFetchSubscriptions(urls, 0, links, ^(NSArray<NSString *> *all, NSError *error) {
+        if (all.count == 0 && placeholders > 0) {
+            completion(all, [NSError errorWithDomain:@"com.happvpn.app" code:1
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                @"Сервер отдал только заглушки (0.0.0.0:1) вместо нод. Обычно это значит, "
+                @"что подписка не активирована/истекла или исчерпан лимит устройств."}]);
+            return;
+        }
         completion(all, error);
     });
 }
@@ -327,6 +426,10 @@ static NSString *HVPNUptime(NSInteger seconds) {
             };
             self.logView.text = [NSString stringWithFormat:@"Запускаю ядро, нод: %lu…",
                                  (unsigned long)links.count];
+            NSString *info = HVPNFormatUserinfo(HVPNLastSubscriptionInfo);
+            if (info.length) {
+                self.logView.text = [self.logView.text stringByAppendingFormat:@"\n%@", info];
+            }
 
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 NSError *sendError = nil;

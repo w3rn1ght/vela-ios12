@@ -123,16 +123,37 @@ static NSString *HVPNPrimaryInterface(void) {
 
         NSError *parseError = nil;
         HVPNProxy *proxy = nil;
+        NSUInteger skippedPlaceholders = 0;
+        NSUInteger skippedUnsupported = 0;
         for (NSString *link in links) {
             NSError *err = nil;
             HVPNProxy *p = [HVPNLinkParser proxyFromLink:link error:&err];
-            if (p != nil) {
-                proxy = p;
-                break;
+            if (p == nil) {
+                if ([HVPNLinkParser isPlaceholderLink:link]) skippedPlaceholders++;
+                else skippedUnsupported++;
+                if (parseError == nil && err != nil) parseError = err;
+                continue;
             }
-            if (parseError == nil && err != nil) parseError = err;
+            if ([HVPNLinkParser isPlaceholderLink:link]) {
+                skippedPlaceholders++;
+                continue;
+            }
+            proxy = p;
+            break;
         }
         if (proxy == nil) {
+            if (skippedPlaceholders > 0) {
+                return [self failure:[NSString stringWithFormat:
+                    @"В подписке только заглушки (0.0.0.0:1) — %lu шт. Панель не выдала ноды: "
+                    @"подписка не активирована, истекла или исчерпан лимит устройств.",
+                    (unsigned long)skippedPlaceholders]];
+            }
+            if (skippedUnsupported > 0) {
+                return [self failure:[NSString stringWithFormat:
+                    @"Ни одна из %lu нод не поддерживается ядром. %@",
+                    (unsigned long)skippedUnsupported,
+                    parseError.localizedDescription ?: @""]];
+            }
             return [self failure:parseError.localizedDescription ?: @"Не удалось разобрать ссылку"];
         }
 

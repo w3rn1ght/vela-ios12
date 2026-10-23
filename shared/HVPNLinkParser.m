@@ -440,6 +440,16 @@ static NSString *HVPNNodeName(NSString *fragment, NSString *host, NSInteger port
     return nil;
 }
 
++ (BOOL)isPlaceholderLink:(NSString *)link {
+    NSError *error = nil;
+    HVPNProxy *proxy = [self proxyFromLink:link error:&error];
+    if (proxy == nil) return NO;   // не заглушка, а просто неподдерживаемая ссылка
+    if (proxy.port <= 1) return YES;
+    NSString *host = proxy.server.lowercaseString;
+    return [host isEqualToString:@"0.0.0.0"] || [host isEqualToString:@"::"] ||
+           [host isEqualToString:@"127.0.0.1"] || [host isEqualToString:@"localhost"];
+}
+
 + (BOOL)looksLikeLink:(NSString *)line {
     NSString *lower = line.lowercaseString;
     return [lower hasPrefix:@"vless://"] || [lower hasPrefix:@"vmess://"] ||

@@ -41,6 +41,10 @@ extern NSString *const HVPNErrorDomain;
 /// Похоже ли на поддерживаемую ссылку (для фильтрации мусора в подписке).
 + (BOOL)looksLikeLink:(NSString *)line;
 
+/// «Заглушка» панели: 0.0.0.0:1 / 127.0.0.1:1 и т.п. Такие ноды панель отдаёт,
+/// когда клиент не передал HWID или подписка не активирована.
++ (BOOL)isPlaceholderLink:(NSString *)link;
+
 @end
 
 NS_ASSUME_NONNULL_END

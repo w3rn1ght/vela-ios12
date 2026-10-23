@@ -110,8 +110,37 @@ int main(void) {
         NSArray<NSString *> *links = [HVPNLinkParser linksFromSubscriptionData:subData];
         expect(links.count == 2, @"two links extracted");
 
-        printf("итоговый конфиг\n");
-        NSMutableDictionary *opts = [@{@"bindInterface": @"en0"} mutableCopy];
+        printf("reality + vision (как в реальных подписках)\n");
+        NSString *realityLink =
+            @"vless://11111111-2222-3333-4444-555555555555@edge.example.net:443"
+            @"?encryption=none&flow=xtls-rprx-vision&security=reality"
+            @"&sni=edge-c11ea3.example.net&fp=firefox"
+            @"&pbk=lpA3qpAdwCdzEW3ZWQxy4gSh5l380VaF3QvkchHqTD8"
+            @"&sid=b8332c19da7f4603&type=tcp#Reality%20Vision";
+        HVPNProxy *reality = parse(realityLink);
+        expect([reality.outbound[@"flow"] isEqualToString:@"xtls-rprx-vision"], @"vision flow");
+        expect([reality.outbound[@"tls"][@"reality"][@"public_key"]
+                isEqualToString:@"lpA3qpAdwCdzEW3ZWQxy4gSh5l380VaF3QvkchHqTD8"], @"reality public_key");
+        expect([reality.outbound[@"tls"][@"reality"][@"short_id"] isEqualToString:@"b8332c19da7f4603"], @"short_id");
+        expect([reality.outbound[@"tls"][@"utls"][@"fingerprint"] isEqualToString:@"firefox"], @"utls fingerprint");
+        expect(reality.outbound[@"transport"] == nil, @"no transport for tcp");
+        expect(![HVPNLinkParser isPlaceholderLink:realityLink], @"real link is not a placeholder");
+
+        printf("xhttp -> понятная ошибка (ядро 1.8 его не умеет)\n");
+        NSError *xhttpError = nil;
+        HVPNProxy *xhttp = [HVPNLinkParser proxyFromLink:
+            @"vless://11111111-2222-3333-4444-555555555555@x.example.net:443"
+            @"?encryption=none&security=tls&sni=x.example.net&fp=chrome&type=xhttp&mode=auto#xhttp"
+            error:&xhttpError];
+        expect(xhttp == nil && [xhttpError.localizedDescription containsString:@"xhttp"], @"xhttp rejected");
+
+        printf("заглушка панели\n");
+        NSString *stubLink =
+            @"vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1"
+            @"?encryption=none&type=tcp&security=none#stub";
+        expect([HVPNLinkParser isPlaceholderLink:stubLink], @"stub detected");
+
+        printf("итоговый конфиг\n");        NSMutableDictionary *opts = [@{@"bindInterface": @"en0"} mutableCopy];
         opts[@"logPath"] = @"/tmp/core.log";
         NSDictionary *config = HVPNBuildConfig(vless, opts);
         NSData *pretty = [NSJSONSerialization dataWithJSONObject:config
