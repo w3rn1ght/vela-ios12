@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.happvpn.daemon</string>
+	<string>com.vela.daemon</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/libexec/happvpnd</string>
+		<string>/usr/libexec/velad</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -15,9 +15,9 @@
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>StandardOutPath</key>
-	<string>/var/mobile/Library/Logs/HappVPN/daemon.log</string>
+	<string>/var/mobile/Library/Logs/Vela/daemon.log</string>
 	<key>StandardErrorPath</key>
-	<string>/var/mobile/Library/Logs/HappVPN/daemon.log</string>
+	<string>/var/mobile/Library/Logs/Vela/daemon.log</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>

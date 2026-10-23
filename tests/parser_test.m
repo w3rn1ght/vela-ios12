@@ -140,6 +140,43 @@ int main(void) {
             @"?encryption=none&type=tcp&security=none#stub";
         expect([HVPNLinkParser isPlaceholderLink:stubLink], @"stub detected");
 
+        printf("Xray-JSON подписка\n");
+        NSDictionary *xray = @{
+            @"outbounds": @[
+                @{
+                    @"tag": @"uni-ppl1",
+                    @"protocol": @"vless",
+                    @"settings": @{@"vnext": @[@{
+                        @"address": @"95.85.250.250",
+                        @"port": @443,
+                        @"users": @[@{
+                            @"id": @"19df57b1-5ed5-4b71-b361-37da1b856b8c",
+                            @"encryption": @"none",
+                            @"flow": @"xtls-rprx-vision"
+                        }]
+                    }]},
+                    @"streamSettings": @{
+                        @"network": @"tcp",
+                        @"security": @"reality",
+                        @"realitySettings": @{
+                            @"serverName": @"edge-c11ea3.example.net",
+                            @"publicKey": @"lpA3qpAdwCdzEW3ZWQxy4gSh5l380VaF3QvkchHqTD8",
+                            @"shortId": @"b8332c19da7f4603",
+                            @"fingerprint": @"firefox"
+                        }
+                    }
+                },
+                @{@"tag": @"direct", @"protocol": @"freedom", @"settings": @{}}
+            ]
+        };
+        NSData *xrayData = [NSJSONSerialization dataWithJSONObject:xray options:0 error:NULL];
+        NSArray<NSString *> *xrayLinks = [HVPNLinkParser linksFromXrayConfigData:xrayData];
+        expect(xrayLinks.count == 1, @"один vless из JSON-конфига");
+        HVPNProxy *fromJSON = parse(xrayLinks.firstObject);
+        expect([fromJSON.outbound[@"flow"] isEqualToString:@"xtls-rprx-vision"], @"flow из JSON");
+        expect([fromJSON.outbound[@"tls"][@"reality"][@"short_id"] isEqualToString:@"b8332c19da7f4603"],
+               @"short_id из JSON");
+
         printf("итоговый конфиг\n");        NSMutableDictionary *opts = [@{@"bindInterface": @"en0"} mutableCopy];
         opts[@"logPath"] = @"/tmp/core.log";
         NSDictionary *config = HVPNBuildConfig(vless, opts);

@@ -24,6 +24,14 @@ static NSString *HVPNStr(id v) {
     return nil;
 }
 
+/// Полное percent-кодирование значения query (безопасно для base64 и пробелов).
+static NSString *HVPNEnc(NSString *value) {
+    if (value.length == 0) return @"";
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
+        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"];
+    return [value stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: value;
+}
+
 static NSString *HVPNNodeName(NSString *fragment, NSString *host, NSInteger port) {
     if (fragment.length) return fragment;
     return [NSString stringWithFormat:@"%@:%ld", host, (long)port];
@@ -477,6 +485,157 @@ static NSString *HVPNNodeName(NSString *fragment, NSString *host, NSInteger port
         if ([self looksLikeLink:line]) [out addObject:line];
     }
     return out;
+}
+
++ (NSArray<NSString *> *)linksFromXrayConfigData:(NSData *)data {
+    if (data.length == 0) return @[];
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![object isKindOfClass:[NSDictionary class]]) return @[];
+    NSArray *outbounds = ((NSDictionary *)object)[@"outbounds"];
+    if (![outbounds isKindOfClass:[NSArray class]]) return @[];
+
+    NSMutableArray<NSString *> *links = [NSMutableArray array];
+    for (NSDictionary *outbound in outbounds) {
+        if (![outbound isKindOfClass:[NSDictionary class]]) continue;
+        NSString *protocol = HVPNStr(outbound[@"protocol"]).lowercaseString;
+        NSDictionary *settings = outbound[@"settings"];
+        NSDictionary *stream = outbound[@"streamSettings"];
+        NSString *tag = HVPNStr(outbound[@"tag"]) ?: @"node";
+        if (![settings isKindOfClass:[NSDictionary class]]) continue;
+
+        NSString *network = HVPNStr(stream[@"network"]) ?: @"tcp";
+        NSString *security = HVPNStr(stream[@"security"]) ?: @"none";
+        NSDictionary *tls = [security isEqualToString:@"reality"]
+            ? stream[@"realitySettings"] : stream[@"tlsSettings"];
+        if (![tls isKindOfClass:[NSDictionary class]]) tls = nil;
+
+        NSMutableArray<NSString *> *query = [NSMutableArray array];
+        if (![network isEqualToString:@"tcp"]) {
+            [query addObject:[@"type=" stringByAppendingString:HVPNEnc(network)]];
+        }
+        if (![security isEqualToString:@"none"]) {
+            [query addObject:[@"security=" stringByAppendingString:HVPNEnc(security)]];
+        }
+        if (HVPNStr(tls[@"serverName"]).length)
+            [query addObject:[@"sni=" stringByAppendingString:HVPNEnc(HVPNStr(tls[@"serverName"]))]];
+        if (HVPNStr(tls[@"fingerprint"]).length)
+            [query addObject:[@"fp=" stringByAppendingString:HVPNEnc(HVPNStr(tls[@"fingerprint"]))]];
+        if (HVPNStr(tls[@"publicKey"]).length)
+            [query addObject:[@"pbk=" stringByAppendingString:HVPNEnc(HVPNStr(tls[@"publicKey"]))]];
+        if (HVPNStr(tls[@"shortId"]).length)
+            [query addObject:[@"sid=" stringByAppendingString:HVPNEnc(HVPNStr(tls[@"shortId"]))]];
+        NSArray *alpn = tls[@"alpn"];
+        if ([alpn isKindOfClass:[NSArray class]] && alpn.count) {
+            NSMutableArray *parts = [NSMutableArray array];
+            for (id item in alpn) if ([item isKindOfClass:[NSString class]]) [parts addObject:item];
+            if (parts.count) [query addObject:[@"alpn=" stringByAppendingString:
+                                           HVPNEnc([parts componentsJoinedByString:@","])]];
+        }
+
+        if ([network isEqualToString:@"ws"]) {
+            NSDictionary *ws = stream[@"wsSettings"];
+            NSString *path = HVPNStr(ws[@"path"]);
+            NSString *host = HVPNStr(ws[@"headers"][@"Host"]) ?: HVPNStr(ws[@"host"]);
+            if (path.length) [query addObject:[@"path=" stringByAppendingString:HVPNEnc(path)]];
+            if (host.length) [query addObject:[@"host=" stringByAppendingString:HVPNEnc(host)]];
+        } else if ([network isEqualToString:@"grpc"]) {
+            NSDictionary *grpc = stream[@"grpcSettings"];
+            NSString *service = HVPNStr(grpc[@"serviceName"]);
+            if (service.length) [query addObject:[@"serviceName=" stringByAppendingString:HVPNEnc(service)]];
+        } else if ([network isEqualToString:@"xhttp"]) {
+            NSDictionary *xhttp = stream[@"xhttpSettings"];
+            NSString *path = HVPNStr(xhttp[@"path"]);
+            NSString *mode = HVPNStr(xhttp[@"mode"]);
+            if (path.length) [query addObject:[@"path=" stringByAppendingString:HVPNEnc(path)]];
+            if (mode.length) [query addObject:[@"mode=" stringByAppendingString:HVPNEnc(mode)]];
+        } else if ([network isEqualToString:@"tcp"]) {
+            NSDictionary *tcp = stream[@"tcpSettings"];
+            NSString *headerType = HVPNStr(tcp[@"header"][@"type"]);
+            if (headerType.length && ![headerType isEqualToString:@"none"]) {
+                [query addObject:[@"headerType=" stringByAppendingString:HVPNEnc(headerType)]];
+                NSString *host = HVPNStr(tcp[@"header"][@"request"][@"headers"][@"Host"][0]);
+                NSString *path = HVPNStr(tcp[@"header"][@"request"][@"path"][0]);
+                if (host.length) [query addObject:[@"host=" stringByAppendingString:HVPNEnc(host)]];
+                if (path.length) [query addObject:[@"path=" stringByAppendingString:HVPNEnc(path)]];
+            }
+        }
+
+        NSString *hostText = nil, *userinfo = nil;
+        NSInteger port = 0;
+
+        if ([protocol isEqualToString:@"vless"]) {
+            NSDictionary *server = [settings[@"vnext"] firstObject];
+            NSDictionary *user = [server[@"users"] firstObject];
+            hostText = HVPNStr(server[@"address"]);
+            port = HVPNStr(server[@"port"]).integerValue;
+            userinfo = HVPNStr(user[@"id"]);
+            NSString *flow = HVPNStr(user[@"flow"]);
+            if (flow.length) [query addObject:[@"flow=" stringByAppendingString:HVPNEnc(flow)]];
+            [query addObject:@"encryption=none"];
+        } else if ([protocol isEqualToString:@"vmess"]) {
+            NSDictionary *server = [settings[@"vnext"] firstObject];
+            NSDictionary *user = [server[@"users"] firstObject];
+            hostText = HVPNStr(server[@"address"]);
+            port = HVPNStr(server[@"port"]).integerValue;
+            NSDictionary *ws = stream[@"wsSettings"];
+            NSMutableDictionary *vmess = [@{
+                @"v": @"2",
+                @"ps": tag,
+                @"add": hostText ?: @"",
+                @"port": [@(port) stringValue],
+                @"id": HVPNStr(user[@"id"]) ?: @"",
+                @"aid": [@(HVPNStr(user[@"alterId"]).integerValue) stringValue],
+                @"scy": @"auto",
+                @"net": network,
+                @"type": @"none",
+                @"host": HVPNStr(ws[@"headers"][@"Host"]) ?: @"",
+                @"path": HVPNStr(ws[@"path"]) ?: @"",
+                @"tls": [security isEqualToString:@"tls"] ? @"tls" : @"",
+                @"sni": HVPNStr(tls[@"serverName"]) ?: @""
+            } mutableCopy];
+            NSData *json = [NSJSONSerialization dataWithJSONObject:vmess options:0 error:NULL];
+            if (json) {
+                [links addObject:[@"vmess://" stringByAppendingString:
+                                  [json base64EncodedStringWithOptions:0]]];
+            }
+            continue;
+        } else if ([protocol isEqualToString:@"trojan"]) {
+            NSDictionary *server = [settings[@"servers"] firstObject];
+            hostText = HVPNStr(server[@"address"]);
+            port = HVPNStr(server[@"port"]).integerValue;
+            userinfo = HVPNStr(server[@"password"]);
+            if (![security isEqualToString:@"none"])
+                [query addObject:[@"security=" stringByAppendingString:HVPNEnc(security)]];
+            else
+                [query addObject:@"security=tls"];
+        } else if ([protocol isEqualToString:@"shadowsocks"]) {
+            NSDictionary *server = [settings[@"servers"] firstObject];
+            hostText = HVPNStr(server[@"address"]);
+            port = HVPNStr(server[@"port"]).integerValue;
+            NSString *method = HVPNStr(server[@"method"]) ?: @"";
+            NSString *password = HVPNStr(server[@"password"]) ?: @"";
+            NSString *credentials = [[NSString stringWithFormat:@"%@:%@", method, password]
+                                     dataUsingEncoding:NSUTF8StringEncoding]
+                                     .base64EncodedStringWithOptions:0;
+            NSString *hostPart = [hostText rangeOfString:@":"].location != NSNotFound
+                ? [NSString stringWithFormat:@"[%@]", hostText] : hostText;
+            [links addObject:[NSString stringWithFormat:@"ss://%@@%@:%ld#%@",
+                              [credentials stringByReplacingOccurrencesOfString:@"=" withString:@""],
+                              hostPart, (long)port, HVPNEnc(tag)]];
+            continue;
+        } else {
+            continue;   // freedom / blackhole / loopback / dns
+        }
+
+        if (hostText.length == 0 || userinfo.length == 0 || port <= 0) continue;
+        NSString *hostPart = [hostText rangeOfString:@":"].location != NSNotFound
+            ? [NSString stringWithFormat:@"[%@]", hostText] : hostText;
+        NSString *link = [NSString stringWithFormat:@"%@://%@@%@:%ld?%@#%@",
+                          protocol, HVPNEnc(userinfo), hostPart, (long)port,
+                          [query componentsJoinedByString:@"&"], HVPNEnc(tag)];
+        [links addObject:link];
+    }
+    return links;
 }
 
 @end

@@ -1,6 +1,6 @@
 #!/bin/sh
 # postrm: остановить демон и убрать маршруты, если он не успел этого сделать.
-DAEMON_PLIST=/Library/LaunchDaemons/com.happvpn.daemon.plist
+DAEMON_PLIST=/Library/LaunchDaemons/com.vela.daemon.plist
 
 launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
 
@@ -10,10 +10,10 @@ if [ -x /sbin/route ]; then
 	done
 fi
 
-rm -rf /var/mobile/Library/HappVPN
+rm -rf /var/mobile/Library/Vela /var/mobile/Library/Logs/Vela
 
 if [ -x /usr/bin/uicache ]; then
-	uicache -p /Applications/HappVPN.app 2>/dev/null || true
+	uicache -p /Applications/Vela.app 2>/dev/null || true
 fi
 
 exit 0

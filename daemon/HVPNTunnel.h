@@ -10,6 +10,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// Убирает «осиротевшие» маршруты, оставшиеся после падения демона.
 + (void)cleanupStaleRoutes;
 
+/// Физический интерфейс (en0 / pdp_ip0) — нужен, чтобы пинговать серверы
+/// мимо собственного tun и привязывать direct-исходящие ядра.
++ (NSString *_Nullable)primaryInterfaceName;
+
+/// TCP-пинг: 3 попытки, медиана. Возвращает {ok, ms, attempts, error}.
+- (NSDictionary *)pingServer:(NSString *)server port:(NSInteger)port;
+
 /// {ok: BOOL, error: string?, status: {...}}
 - (NSDictionary *)startWithLinks:(NSArray<NSString *> *)links options:(NSDictionary *_Nullable)options;
 - (NSDictionary *)stop;

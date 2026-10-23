@@ -2,12 +2,15 @@
 #import "HVPNConfig.h"
 #import "HVPNLinkParser.h"
 #import "HVPNRoute.h"
+#import "HVPNPaths.h"
 
 #include <spawn.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
+#include <poll.h>
 #include <string.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -17,10 +20,10 @@
 #include <netdb.h>
 #include <crt_externs.h>
 
-static NSString *const kBaseDir = @"/var/mobile/Library/HappVPN";
-static NSString *const kConfigPath = @"/var/mobile/Library/HappVPN/core.json";
-static NSString *const kCoreLogPath = @"/var/mobile/Library/HappVPN/core.log";
-static NSString *const kCorePath = @"/usr/libexec/happvpn/sing-box";
+static NSString *const kBaseDir = HVPNStateDir;
+static NSString *const kConfigPath = HVPNCoreConfigPath;
+static NSString *const kCoreLogPath = HVPNCoreLogPath;
+static NSString *const kCorePath = HVPNCorePath;
 
 static NSArray<NSString *> *HVPNUtunNames(void) {
     NSMutableArray *utuns = [NSMutableArray array];
@@ -103,6 +106,10 @@ static NSString *HVPNPrimaryInterface(void) {
 }
 
 // MARK: - Очистка
+
++ (NSString *)primaryInterfaceName {
+    return HVPNPrimaryInterface();
+}
 
 + (void)cleanupStaleRoutes {
     // Если демон упал в подключённом состоянии, split-маршруты остаются в ядре
@@ -414,6 +421,118 @@ static NSString *HVPNPrimaryInterface(void) {
     _nodeServer = nil;
     _nodeType = nil;
     _startedAt = nil;
+}
+
+// MARK: - Пинг
+
+#ifndef IP_BOUND_IF
+#define IP_BOUND_IF 25
+#endif
+
+static double HVPNNow(void) {
+    return CFAbsoluteTimeGetCurrent() * 1000.0;
+}
+
+static NSInteger HVPNPingOnce(NSString *ip, NSInteger port, unsigned ifindex,
+                              NSTimeInterval timeout, NSString **errorText) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (errorText) *errorText = HVPNErrnoString();
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    // Привязка к физическому интерфейсу: иначе при поднятом tun пакет уйдёт в него.
+    if (ifindex > 0) {
+        int index = (int)ifindex;
+        if (setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index)) != 0) {
+            NSLog(@"[velad] IP_BOUND_IF(%u) не применился: %@", ifindex, HVPNErrnoString());
+        }
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip.UTF8String, &addr.sin_addr) != 1) {
+        close(fd);
+        if (errorText) *errorText = @"плохой IP";
+        return -1;
+    }
+
+    double started = HVPNNow();
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    NSInteger elapsed = -1;
+
+    if (rc == 0) {
+        elapsed = (NSInteger)llround(HVPNNow() - started);
+    } else if (errno == EINPROGRESS) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        rc = poll(&pfd, 1, (int)(timeout * 1000));
+        if (rc > 0) {
+            int soError = 0;
+            socklen_t length = sizeof(soError);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &length) == 0 && soError == 0) {
+                elapsed = (NSInteger)llround(HVPNNow() - started);
+            } else if (errorText) {
+                *errorText = [NSString stringWithUTF8String:strerror(soError)] ?: @"connect failed";
+            }
+        } else if (rc == 0) {
+            if (errorText) *errorText = @"таймаут";
+        } else if (errorText) {
+            *errorText = HVPNErrnoString();
+        }
+    } else if (errorText) {
+        *errorText = HVPNErrnoString();
+    }
+
+    close(fd);
+    return elapsed;
+}
+
+- (NSDictionary *)pingServer:(NSString *)server port:(NSInteger)port {
+    if (server.length == 0 || port <= 0) {
+        return @{@"ok": @NO, @"error": @"нет server/port"};
+    }
+    if (port > 65535) port = 65535;
+
+    NSArray<NSString *> *addresses = HVPNResolveIPv4(server);
+    if (addresses.count == 0) {
+        if ([server rangeOfString:@":"].location != NSNotFound) {
+            return @{@"ok": @NO, @"error": @"IPv6-сервер: пинг не реализован"};
+        }
+        return @{@"ok": @NO, @"error": @"не удалось отрезолвить"};
+    }
+
+    unsigned ifindex = 0;
+    NSString *gateway = nil;
+    if (HVPNGetDefaultGateway(AF_INET, &gateway, &ifindex)) {
+        // индекс физического интерфейса уже внутри gateway-записи
+    }
+
+    NSString *lastError = nil;
+    NSMutableArray<NSNumber *> *samples = [NSMutableArray array];
+    for (int attempt = 0; attempt < 3; attempt++) {
+        NSString *error = nil;
+        NSInteger ms = HVPNPingOnce(addresses.firstObject, port, ifindex, 3.0, &error);
+        if (ms >= 0) [samples addObject:@(ms)];
+        else if (error.length) lastError = error;
+        if (attempt < 2) usleep(120 * 1000);
+    }
+
+    if (samples.count == 0) {
+        return @{@"ok": @NO,
+                 @"error": lastError.length ? lastError : @"нет ответа",
+                 @"attempts": @[]};
+    }
+    NSArray *sorted = [samples sortedArrayUsingSelector:@selector(compare:)];
+    NSInteger median = [sorted[sorted.count / 2] integerValue];
+    return @{@"ok": @YES, @"ms": @(median), @"attempts": sorted};
 }
 
 @end

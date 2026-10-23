@@ -45,6 +45,10 @@ extern NSString *const HVPNErrorDomain;
 /// когда клиент не передал HWID или подписка не активирована.
 + (BOOL)isPlaceholderLink:(NSString *)link;
 
+/// Панели (Remnawave/Xray) могут отдать вместо списка ссылок готовый JSON-конфиг.
+/// Достаём из него vless/vmess/trojan/shadowsocks и превращаем в обычные ссылки.
++ (NSArray<NSString *> *)linksFromXrayConfigData:(NSData *)data;
+
 @end
 
 NS_ASSUME_NONNULL_END

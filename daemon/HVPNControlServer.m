@@ -1,6 +1,7 @@
 #import "HVPNControlServer.h"
 #import "HVPNTunnel.h"
 #import "HVPNConfig.h"
+#import "HVPNPaths.h"
 
 #include <errno.h>
 #include <string.h>
@@ -10,7 +11,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 
-static NSString *const kSocketPath = @"/var/mobile/Library/HappVPN/control.sock";
+static NSString *const kSocketPath = HVPNControlSocketPath;
 static const size_t kMaxRequest = 4 * 1024 * 1024;
 
 static NSData *HVPNReadAll(int fd) {
@@ -55,16 +56,34 @@ static NSDictionary *HVPNHandleRequest(NSDictionary *request) {
         return @{@"ok": @YES, @"version": HVPNVersionString, @"status": [tunnel status]};
     }
     if ([cmd isEqualToString:@"start"]) {
-        id links = request[@"links"];
-        if (![links isKindOfClass:[NSArray class]] || [(NSArray *)links count] == 0) {
-            return @{@"ok": @NO, @"error": @"links: нужен непустой массив ссылок"};
+        NSArray *links = nil;
+        id single = request[@"link"];
+        if ([single isKindOfClass:[NSString class]] && [(NSString *)single length] > 0) {
+            links = @[single];
+        } else {
+            id list = request[@"links"];
+            if ([list isKindOfClass:[NSArray class]]) links = list;
+        }
+        if (links.count == 0) {
+            return @{@"ok": @NO, @"error": @"нужен link (строка) или links (массив)"};
         }
         id options = request[@"options"];
-        NSDictionary *result = [tunnel startWithLinks:(NSArray *)links
+        NSDictionary *result = [tunnel startWithLinks:links
                                              options:[options isKindOfClass:[NSDictionary class]] ? options : nil];
         NSMutableDictionary *response = [result mutableCopy];
         response[@"version"] = HVPNVersionString;
         return response;
+    }
+    if ([cmd isEqualToString:@"ping"]) {
+        NSString *server = request[@"server"];
+        NSInteger port = [request[@"port"] integerValue];
+        if (![server isKindOfClass:[NSString class]] || server.length == 0) {
+            return @{@"ok": @NO, @"error": @"нет server"};
+        }
+        NSMutableDictionary *result = [[tunnel pingServer:server port:port] mutableCopy];
+        result[@"server"] = server;
+        result[@"port"] = @(port);
+        return result;
     }
     if ([cmd isEqualToString:@"stop"]) {
         NSMutableDictionary *result = [[tunnel stop] mutableCopy];

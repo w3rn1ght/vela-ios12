@@ -8,7 +8,7 @@ MIN_IOS="${MIN_IOS:-12.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
 SRC_DIR="$BUILD_DIR/sing-box"
-OUT_DIR="$ROOT/layout/usr/libexec/happvpn"
+OUT_DIR="$ROOT/layout/usr/libexec/vela"
 OUT_BIN="$OUT_DIR/sing-box"
 TAGS="with_gvisor,with_quic,with_utls,with_wireguard,with_dhcp"
 

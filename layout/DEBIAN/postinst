@@ -1,20 +1,30 @@
 #!/bin/sh
-# postinst: права, каталоги и запуск демона.
-DAEMON_PLIST=/Library/LaunchDaemons/com.happvpn.daemon.plist
-STATE_DIR=/var/mobile/Library/HappVPN
-LOG_DIR=/var/mobile/Library/Logs/HappVPN
+# postinst: права, каталоги, запуск демона, уборка старого пакета HappVPN.
+DAEMON_PLIST=/Library/LaunchDaemons/com.vela.daemon.plist
+STATE_DIR=/var/mobile/Library/Vela
+LOG_DIR=/var/mobile/Library/Logs/Vela
+
+# --- миграция с прошлой версии (com.happvpn.jb) ---
+if [ -f /Library/LaunchDaemons/com.happvpn.daemon.plist ]; then
+	launchctl unload /Library/LaunchDaemons/com.happvpn.daemon.plist 2>/dev/null || true
+	rm -f /Library/LaunchDaemons/com.happvpn.daemon.plist
+fi
+rm -rf /Applications/HappVPN.app /usr/libexec/happvpnd /usr/libexec/happvpn
+rm -rf /var/mobile/Library/HappVPN
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
-chown root:wheel "$STATE_DIR" 2>/dev/null || true
+# Каталог состояния принадлежит mobile: приложение пишет туда nodes.json,
+# демон (root) — core.json/core.log; root пишет в чужой каталог без проблем.
+chown mobile:mobile "$STATE_DIR" 2>/dev/null || chown 501:501 "$STATE_DIR" 2>/dev/null || true
 chown root:wheel "$LOG_DIR" 2>/dev/null || true
 chmod 755 "$STATE_DIR" "$LOG_DIR"
 
-chown root:wheel /usr/libexec/happvpnd 2>/dev/null || true
-chmod 755 /usr/libexec/happvpnd
+chown root:wheel /usr/libexec/velad 2>/dev/null || true
+chmod 755 /usr/libexec/velad
 
-if [ -f /usr/libexec/happvpn/sing-box ]; then
-	chown root:wheel /usr/libexec/happvpn/sing-box 2>/dev/null || true
-	chmod 755 /usr/libexec/happvpn/sing-box
+if [ -f /usr/libexec/vela/sing-box ]; then
+	chown root:wheel /usr/libexec/vela/sing-box 2>/dev/null || true
+	chmod 755 /usr/libexec/vela/sing-box
 fi
 
 chown root:wheel "$DAEMON_PLIST" 2>/dev/null || true
@@ -24,7 +34,7 @@ launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
 launchctl load "$DAEMON_PLIST" 2>/dev/null || true
 
 if [ -x /usr/bin/uicache ]; then
-	uicache -p /Applications/HappVPN.app 2>/dev/null || true
+	uicache -p /Applications/Vela.app 2>/dev/null || true
 elif [ -x /usr/bin/uicache-legacy ]; then
 	uicache-legacy 2>/dev/null || true
 fi

@@ -1,11 +1,7 @@
-// HappVPN — минимальный GUI для демона happvpnd.
-// Всё, что делает приложение: собирает ссылки (в т.ч. https-подписки),
-// отправляет их демону по unix-сокету и показывает статус.
+// Vela — VPN-клиент для jailbroken iOS 12.
+// UI: список нод (таблица), выбор активной, пинг, лог. Вся сеть — через демон velad.
 #import <UIKit/UIKit.h>
 #include <dispatch/dispatch.h>
-
-#import "HVPNConfig.h"
-#import "HVPNLinkParser.h"
 
 #include <errno.h>
 #include <string.h>
@@ -13,10 +9,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
-#include <sys/utsname.h>
 
-static NSString *const kSocketPath = @"/var/mobile/Library/HappVPN/control.sock";
-static NSString *const kLinksDefaultsKey = @"HappVPNLinks";
+#import "HVPNConfig.h"
+#import "HVPNLinkParser.h"
+#import "HVPNPaths.h"
+#import "HVPNStore.h"
 
 #pragma mark - Клиент демона
 
@@ -36,16 +33,16 @@ static BOOL HVPNWriteAllKey(int fd, NSData *data) {
     return YES;
 }
 
-static NSData *HVPNSendRaw(NSDictionary *request, NSError **error) {
+static NSDictionary *HVPNSend(NSDictionary *request, NSError **error, NSTimeInterval timeout) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        if (error) *error = [NSError errorWithDomain:@"com.happvpn.app" code:errno
+        if (error) *error = [NSError errorWithDomain:@"com.vela.app" code:errno
                                             userInfo:@{NSLocalizedDescriptionKey: @"socket() failed"}];
         return nil;
     }
 
     struct timeval tv;
-    tv.tv_sec = 60;
+    tv.tv_sec = (time_t)timeout;
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -53,37 +50,31 @@ static NSData *HVPNSendRaw(NSDictionary *request, NSError **error) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, kSocketPath.fileSystemRepresentation, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, HVPNControlSocketPath.fileSystemRepresentation, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
         if (error) {
-            *error = [NSError errorWithDomain:@"com.happvpn.app" code:errno
+            *error = [NSError errorWithDomain:@"com.vela.app" code:errno
                                      userInfo:@{NSLocalizedDescriptionKey:
-                                                    @"Демон не отвечает. Проверьте, что пакет установлен и "
-                                                    @"happvpnd запущен (launchctl list | grep happvpn)."}];
+                @"Демон velad не отвечает. Проверьте, что пакет установлен и "
+                @"`launchctl list | grep vela` показывает процесс."}];
         }
         return nil;
     }
 
-    NSError *jsonError = nil;
-    NSData *payload = [NSJSONSerialization dataWithJSONObject:request options:0 error:&jsonError];
-    if (payload == nil) {
-        close(fd);
-        if (error) *error = jsonError;
-        return nil;
-    }
-    NSMutableData *line = [payload mutableCopy];
+    NSData *payload = [NSJSONSerialization dataWithJSONObject:request options:0 error:NULL];
+    NSMutableData *line = [payload mutableCopy] ?: [NSMutableData data];
     [line appendBytes:"\n" length:1];
     HVPNWriteAllKey(fd, line);
     shutdown(fd, SHUT_WR);
 
     NSMutableData *response = [NSMutableData data];
-    char buf[4096];
+    char buffer[4096];
     while (YES) {
-        ssize_t n = read(fd, buf, sizeof(buf));
+        ssize_t n = read(fd, buffer, sizeof(buffer));
         if (n > 0) {
-            [response appendBytes:buf length:(NSUInteger)n];
+            [response appendBytes:buffer length:(NSUInteger)n];
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
@@ -91,455 +82,537 @@ static NSData *HVPNSendRaw(NSDictionary *request, NSError **error) {
     }
     close(fd);
 
-    if (response.length == 0) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"com.happvpn.app" code:EPIPE
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Демон закрыл соединение без ответа"}];
-        }
-        return nil;
-    }
-    return response;
-}
-
-static NSDictionary *HVPNSend(NSDictionary *request, NSError **error) {
-    NSData *data = HVPNSendRaw(request, error);
-    if (data == nil) return nil;
-    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    id parsed = [NSJSONSerialization JSONObjectWithData:response options:0 error:NULL];
     if (![parsed isKindOfClass:[NSDictionary class]]) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"com.happvpn.app" code:EINVAL
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Некорректный ответ демона"}];
-        }
+        if (error) *error = [NSError errorWithDomain:@"com.vela.app" code:EINVAL
+                                            userInfo:@{NSLocalizedDescriptionKey: @"Некорректный ответ демона"}];
         return nil;
     }
     return parsed;
 }
 
-#pragma mark - Подписки
-
-static NSString *HVPNTrim(NSString *s) {
-    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+static NSDictionary *HVPNSendQuick(NSDictionary *request) {
+    return HVPNSend(request, NULL, 60);
 }
 
-// Панели (Remnawave и совместимые) привязывают подписку к устройству по заголовку
-// x-hwid: без него вместо нод отдают заглушки 0.0.0.0:1 с просьбой «включить HWID».
-// Идентификатор генерируется один раз и живёт в NSUserDefaults.
-static NSString *HVPNHWID(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSString *hwid = [defaults stringForKey:@"HappVPNHWID"];
-    if (hwid.length == 0) {
-        hwid = [[NSUUID UUID] UUIDString];
-        [defaults setObject:hwid forKey:@"HappVPNHWID"];
-        [defaults synchronize];
-    }
-    return hwid;
+static NSString *HVPNPingText(HVPNNode *node) {
+    if (!node.supported) return @"не поддерживается";
+    if (node.pingMs >= 0) return [NSString stringWithFormat:@"%ld мс", (long)node.pingMs];
+    if (node.pingError.length) return node.pingError;
+    return @"—";
 }
 
-static NSString *HVPNDeviceModel(void) {
-    struct utsname info;
-    if (uname(&info) == 0) {
-        NSString *machine = [NSString stringWithUTF8String:info.machine];
-        if (machine.length) return machine;
-    }
-    return @"iPhone";
-}
+#pragma mark - Экран добавления
 
-static NSString *HVPNLastSubscriptionInfo = nil;
-
-static NSString *HVPNFormatBytes(long long bytes) {
-    if (bytes <= 0) return @"0";
-    double value = (double)bytes;
-    NSArray<NSString *> *units = @[@"Б", @"КБ", @"МБ", @"ГБ", @"ТБ"];
-    NSUInteger index = 0;
-    while (value >= 1024.0 && index + 1 < units.count) {
-        value /= 1024.0;
-        index++;
-    }
-    return [NSString stringWithFormat:@"%.1f %@", value, units[index]];
-}
-
-// subscription-userinfo: upload=0; download=16145860601; total=0; expire=1795938367
-static NSString *HVPNFormatUserinfo(NSString *raw) {
-    if (raw.length == 0) return nil;
-    long long download = 0, total = 0, expire = 0;
-    for (NSString *part in [raw componentsSeparatedByString:@";"]) {
-        NSString *pair = HVPNTrim(part);
-        NSRange eq = [pair rangeOfString:@"="];
-        if (eq.location == NSNotFound) continue;
-        NSString *key = [pair substringToIndex:eq.location];
-        long long value = [pair substringFromIndex:eq.location + 1].longLongValue;
-        if ([key isEqualToString:@"download"]) download = value;
-        else if ([key isEqualToString:@"total"]) total = value;
-        else if ([key isEqualToString:@"expire"]) expire = value;
-    }
-    NSMutableString *text = [NSMutableString stringWithFormat:@"Трафик: %@", HVPNFormatBytes(download)];
-    [text appendFormat:(total > 0 ? @" / %@" : @" (без лимита)"), total > 0 ? HVPNFormatBytes(total) : @""];
-    if (expire > 0) {
-        NSDateFormatter *formatter = [NSDateFormatter new];
-        formatter.dateFormat = @"dd.MM.yyyy";
-        [text appendFormat:@", до %@", [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:expire]]];
-    }
-    return text;
-}
-
-static NSURLRequest *HVPNSubscriptionRequest(NSURL *url) {
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    // Панели выбирают формат ответа по User-Agent: для v2ray-совместимых клиентов
-    // отдают обычный base64-список ссылок, для Happ — свой JSON.
-    [request setValue:@"v2rayNG/1.8.5" forHTTPHeaderField:@"User-Agent"];
-    [request setValue:HVPNHWID() forHTTPHeaderField:@"x-hwid"];
-    [request setValue:@"iOS" forHTTPHeaderField:@"x-device-os"];
-    [request setValue:[[UIDevice currentDevice] systemVersion] forHTTPHeaderField:@"x-ver-os"];
-    [request setValue:HVPNDeviceModel() forHTTPHeaderField:@"x-device-model"];
-    [request setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    request.timeoutInterval = 30;
-    return request;
-}
-
-static void HVPNCollectLinks(NSString *text,
-                            NSUInteger depth,
-                            void (^completion)(NSArray<NSString *> *links, NSError *error));
-
-static void HVPNFetchSubscriptions(NSArray<NSString *> *urls,
-                                   NSUInteger index,
-                                   NSMutableArray<NSString *> *links,
-                                   void (^completion)(NSArray<NSString *> *, NSError *)) {
-    if (index >= urls.count) {
-        completion(links, nil);
-        return;
-    }
-    NSURL *url = [NSURL URLWithString:urls[index]];
-    if (url == nil) {
-        HVPNFetchSubscriptions(urls, index + 1, links, completion);
-        return;
-    }
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
-        dataTaskWithRequest:HVPNSubscriptionRequest(url)
-          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSString *userinfo = [(NSHTTPURLResponse *)response allHeaderFields][@"subscription-userinfo"];
-            if ([userinfo isKindOfClass:[NSString class]] && userinfo.length) {
-                HVPNLastSubscriptionInfo = userinfo;
-            }
-        }
-        NSMutableArray<NSString *> *found = [NSMutableArray array];
-        if (data.length) {
-            NSArray<NSString *> *parsed = [HVPNLinkParser linksFromSubscriptionData:data];
-            if (parsed.count) [found addObjectsFromArray:parsed];
-        }
-        if (found.count == 0) {
-            HVPNFetchSubscriptions(urls, index + 1, links, completion);
-            return;
-        }
-        // Внутри подписки могут быть свои подписки — рекурсия ограничена depth.
-        NSMutableString *joined = [NSMutableString string];
-        for (NSString *link in found) [joined appendFormat:@"%@\n", link];
-        HVPNCollectLinks(joined, 2, ^(NSArray<NSString *> *nested, NSError *nestedError) {
-            [links addObjectsFromArray:nested];
-            HVPNFetchSubscriptions(urls, index + 1, links, completion);
-        });
-    }];
-    [task resume];
-}
-
-static void HVPNCollectLinks(NSString *text,
-                            NSUInteger depth,
-                            void (^completion)(NSArray<NSString *> *links, NSError *error)) {
-    NSMutableArray<NSString *> *links = [NSMutableArray array];
-    NSMutableArray<NSString *> *urls = [NSMutableArray array];
-    NSUInteger placeholders = 0;
-
-    for (NSString *line in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
-        NSString *t = HVPNTrim(line);
-        if (t.length == 0 || [t hasPrefix:@"#"]) continue;
-        NSString *lower = t.lowercaseString;
-        if ([lower hasPrefix:@"http://"] || [lower hasPrefix:@"https://"]) {
-            [urls addObject:t];
-        } else if ([HVPNLinkParser isPlaceholderLink:t]) {
-            placeholders++;
-        } else {
-            [links addObject:t];
-        }
-    }
-
-    if (urls.count == 0 || depth > 1) {
-        if (links.count == 0 && placeholders > 0) {
-            completion(links, [NSError errorWithDomain:@"com.happvpn.app" code:1
-                                              userInfo:@{NSLocalizedDescriptionKey:
-                @"Сервер отдал только заглушки (0.0.0.0:1) вместо нод. Обычно это значит, "
-                @"что подписка не активирована/истекла или исчерпан лимит устройств."}]);
-            return;
-        }
-        completion(links, nil);
-        return;
-    }
-
-    HVPNFetchSubscriptions(urls, 0, links, ^(NSArray<NSString *> *all, NSError *error) {
-        if (all.count == 0 && placeholders > 0) {
-            completion(all, [NSError errorWithDomain:@"com.happvpn.app" code:1
-                                            userInfo:@{NSLocalizedDescriptionKey:
-                @"Сервер отдал только заглушки (0.0.0.0:1) вместо нод. Обычно это значит, "
-                @"что подписка не активирована/истекла или исчерпан лимит устройств."}]);
-            return;
-        }
-        completion(all, error);
-    });
-}
-
-#pragma mark - UI
-
-static NSString *HVPNUptime(NSInteger seconds) {
-    return [NSString stringWithFormat:@"%02ld:%02ld:%02ld",
-            (long)(seconds / 3600), (long)((seconds % 3600) / 60), (long)(seconds % 60)];
-}
-
-@interface HVPNViewController : UIViewController <UITextViewDelegate>
-@property (nonatomic, strong) UITextView *linksView;
-@property (nonatomic, strong) UIButton *connectButton;
-@property (nonatomic, strong) UIButton *logButton;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UITextView *logView;
-@property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic, strong) NSDictionary *lastStatus;
-@property (nonatomic, assign) BOOL busy;
-@property (nonatomic, assign) BOOL polling;
+@interface HVPNAddViewController : UIViewController <UITextViewDelegate>
+@property (nonatomic, copy) void (^onFinish)(void);
 @end
 
-@implementation HVPNViewController
+@implementation HVPNAddViewController {
+    UITextView *_textView;
+    UIButton *_addButton;
+    UILabel *_hintLabel;
+    UIActivityIndicatorView *_spinner;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"HappVPN";
-    self.view.backgroundColor = [UIColor colorWithWhite:0.96 alpha:1.0];
+    self.title = @"Добавить";
+    self.view.backgroundColor = [UIColor groupTableViewBackgroundColor];
 
-    CGFloat width = self.view.bounds.size.width;
-    CGFloat height = self.view.bounds.size.height;
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+                                                      target:self action:@selector(cancel)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Добавить" style:UIBarButtonItemStyleDone
+                                        target:self action:@selector(add)];
 
-    UILabel *linksCaption = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, width - 32, 18)];
-    linksCaption.text = @"Ссылки или https-подписки (по одной в строке)";
-    linksCaption.font = [UIFont systemFontOfSize:12];
-    linksCaption.textColor = [UIColor darkGrayColor];
-    [self.view addSubview:linksCaption];
+    UILabel *caption = [UILabel new];
+    caption.translatesAutoresizingMaskIntoConstraints = NO;
+    caption.text = @"Ссылки или https-подписки — по одной в строке";
+    caption.font = [UIFont systemFontOfSize:12];
+    caption.textColor = [UIColor darkGrayColor];
+    caption.numberOfLines = 0;
+    [self.view addSubview:caption];
 
-    self.linksView = [[UITextView alloc] initWithFrame:CGRectMake(12, 32, width - 24, 132)];
-    self.linksView.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
-    self.linksView.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.linksView.autocorrectionType = UITextAutocorrectionTypeNo;
-    self.linksView.spellCheckingType = UITextSpellCheckingTypeNo;
-    self.linksView.keyboardType = UIKeyboardTypeURL;
-    self.linksView.text = [[NSUserDefaults standardUserDefaults] stringForKey:kLinksDefaultsKey] ?: @"";
-    self.linksView.layer.borderWidth = 0.5;
-    self.linksView.layer.borderColor = [UIColor colorWithWhite:0.7 alpha:1.0].CGColor;
-    self.linksView.layer.cornerRadius = 6;
-    self.linksView.delegate = self;
-    [self.view addSubview:self.linksView];
+    _textView = [UITextView new];
+    _textView.translatesAutoresizingMaskIntoConstraints = NO;
+    _textView.font = [UIFont fontWithName:@"Menlo" size:12] ?: [UIFont systemFontOfSize:12];
+    _textView.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _textView.autocorrectionType = UITextAutocorrectionTypeNo;
+    _textView.spellCheckingType = UITextSpellCheckingTypeNo;
+    _textView.keyboardType = UIKeyboardTypeURL;
+    _textView.backgroundColor = [UIColor whiteColor];
+    _textView.layer.cornerRadius = 8;
+    _textView.layer.borderWidth = 0.5;
+    _textView.layer.borderColor = [UIColor colorWithWhite:0.75 alpha:1.0].CGColor;
+    // Ключевое: внутренние отступы, чтобы текст не прилипал к краю и не «уезжал».
+    _textView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    _textView.contentInset = UIEdgeInsetsZero;
+    _textView.scrollIndicatorInsets = UIEdgeInsetsZero;
+    _textView.delegate = self;
+    _textView.text = @"";
+    [self.view addSubview:_textView];
 
-    self.connectButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.connectButton.frame = CGRectMake(12, 174, width - 100, 44);
-    self.connectButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [self.connectButton setTitle:@"Подключить" forState:UIControlStateNormal];
-    [self.connectButton addTarget:self action:@selector(toggleConnection:)
-                 forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.connectButton];
+    _hintLabel = [UILabel new];
+    _hintLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _hintLabel.font = [UIFont systemFontOfSize:11];
+    _hintLabel.textColor = [UIColor darkGrayColor];
+    _hintLabel.numberOfLines = 0;
+    _hintLabel.text = @"Поддерживаются vless, vmess, trojan, ss, hysteria2, tuic и https-подписки.";
+    [self.view addSubview:_hintLabel];
 
-    self.logButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.logButton.frame = CGRectMake(width - 84, 174, 72, 44);
-    [self.logButton setTitle:@"Лог" forState:UIControlStateNormal];
-    [self.logButton addTarget:self action:@selector(showLog:)
+    _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleGray];
+    _spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    _spinner.hidesWhenStopped = YES;
+    [self.view addSubview:_spinner];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [caption.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
+        [caption.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [caption.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+
+        [_textView.topAnchor constraintEqualToAnchor:caption.bottomAnchor constant:8],
+        [_textView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [_textView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [_textView.heightAnchor constraintEqualToConstant:220],
+
+        [_hintLabel.topAnchor constraintEqualToAnchor:_textView.bottomAnchor constant:10],
+        [_hintLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [_hintLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+
+        [_spinner.topAnchor constraintEqualToAnchor:_hintLabel.bottomAnchor constant:12],
+        [_spinner.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor]
+    ]];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [_textView becomeFirstResponder];
+}
+
+- (void)cancel {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)add {
+    NSString *text = [_textView.text stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (text.length == 0) return;
+
+    self.navigationItem.rightBarButtonItem.enabled = NO;
+    [_spinner startAnimating];
+    _hintLabel.text = @"Проверяю ссылки и подписки…";
+
+    __weak HVPNAddViewController *weakSelf = self;
+    [[HVPNStore shared] addFromText:text completion:^(NSUInteger added, NSError *error) {
+        HVPNAddViewController *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        [strongSelf->_spinner stopAnimating];
+        strongSelf.navigationItem.rightBarButtonItem.enabled = YES;
+
+        NSArray<NSString *> *diagnostics = [[HVPNStore shared] diagnostics];
+        NSMutableString *report = [NSMutableString string];
+        for (NSString *line in diagnostics) [report appendFormat:@"%@\n", line];
+
+        if (added > 0) {
+            strongSelf->_hintLabel.text = [NSString stringWithFormat:@"Добавлено нод: %lu",
+                                           (unsigned long)added];
+            if (strongSelf.onFinish) strongSelf.onFinish();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [strongSelf dismissViewControllerAnimated:YES completion:nil];
+            });
+            return;
+        }
+
+        NSString *message = error.localizedDescription ?: @"Ничего не добавлено";
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Не получилось"
+                                                                      message:[message stringByAppendingFormat:
+                                                                               @"\n\n%@", report]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [strongSelf presentViewController:alert animated:YES completion:nil];
+        strongSelf->_hintLabel.text = message;
+    }];
+}
+
+@end
+
+#pragma mark - Лог
+
+@interface HVPNLogViewController : UIViewController
+@end
+
+@implementation HVPNLogViewController {
+    UITextView *_textView;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Лог";
+    self.view.backgroundColor = [UIColor whiteColor];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                      target:self action:@selector(close)];
+
+    _textView = [UITextView new];
+    _textView.translatesAutoresizingMaskIntoConstraints = NO;
+    _textView.editable = NO;
+    _textView.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
+    _textView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    _textView.text = @"загружаю…";
+    [self.view addSubview:_textView];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_textView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_textView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [_textView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [_textView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor]
+    ]];
+
+    NSMutableString *text = [NSMutableString string];
+    for (NSString *line in [HVPNStore shared].diagnostics) [text appendFormat:@"%@\n", line];
+    if (text.length == 0) [text appendString:@"(отчётов о подписках нет)\n"];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *response = HVPNSend(@{@"cmd": @"log"}, NULL, 10);
+        NSString *coreLog = [response[@"log"] isKindOfClass:[NSString class]] ? response[@"log"] : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [text appendString:@"\n— ядро —\n"];
+            [text appendString:coreLog.length ? coreLog : @"(лог пуст или демон не запущен)"];
+            self->_textView.text = text;
+        });
+    });
+}
+
+- (void)close {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+#pragma mark - Список нод
+
+@interface HVPNNodesViewController : UITableViewController
+@end
+
+@implementation HVPNNodesViewController {
+    UILabel *_statusLabel;
+    UIButton *_connectButton;
+    NSDictionary *_lastStatus;
+    BOOL _busy;
+    BOOL _pinging;
+    BOOL _polling;
+    NSTimer *_timer;
+    NSUInteger _pingRemaining;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Vela";
+    self.tableView.rowHeight = 58;
+    self.tableView.tableFooterView = [UIView new];
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
+                                                      target:self action:@selector(showAdd)];
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Лог" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(showLogAction:)];
+
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 56)];
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, header.bounds.size.width - 32, 44)];
+    _statusLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    _statusLabel.numberOfLines = 2;
+    _statusLabel.font = [UIFont systemFontOfSize:12];
+    _statusLabel.text = @"Проверяю демон…";
+    _statusLabel.textColor = [UIColor darkGrayColor];
+    [header addSubview:_statusLabel];
+    self.tableView.tableHeaderView = header;
+
+    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 68)];
+    footer.backgroundColor = [UIColor clearColor];
+    _connectButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _connectButton.frame = CGRectMake(12, 10, footer.bounds.size.width - 24, 48);
+    _connectButton.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    _connectButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    _connectButton.layer.cornerRadius = 10;
+    _connectButton.backgroundColor = [UIColor whiteColor];
+    [_connectButton setTitle:@"Подключить" forState:UIControlStateNormal];
+    [_connectButton addTarget:self action:@selector(toggleConnection)
              forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.logButton];
+    [footer addSubview:_connectButton];
+    // Кнопка живёт внизу экрана, а не в конце списка из 150 нод.
+    footer.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    footer.tag = 555;
+    [self.view addSubview:footer];
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 224, width - 32, 56)];
-    self.statusLabel.numberOfLines = 0;
-    self.statusLabel.font = [UIFont systemFontOfSize:12];
-    self.statusLabel.text = @"Проверяю демон…";
-    [self.view addSubview:self.statusLabel];
+    self.tableView.contentInset = UIEdgeInsetsMake(0, 0, 76, 0);
+    self.tableView.scrollIndicatorInsets = UIEdgeInsetsMake(0, 0, 76, 0);
 
-    self.logView = [[UITextView alloc] initWithFrame:CGRectMake(12, 286, width - 24, height - 300)];
-    self.logView.editable = NO;
-    self.logView.font = [UIFont fontWithName:@"Menlo" size:9] ?: [UIFont systemFontOfSize:9];
-    self.logView.autoresizingMask = UIViewAutoresizingFlexibleHeight;
-    self.logView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.7];
-    self.logView.layer.borderWidth = 0.5;
-    self.logView.layer.borderColor = [UIColor colorWithWhite:0.8 alpha:1.0].CGColor;
-    self.logView.text = @"";
-    [self.view addSubview:self.logView];
+    self.refreshControl = [[UIRefreshControl alloc] init];
+    [self.refreshControl addTarget:self action:@selector(pingAllAction:)
+                  forControlEvents:UIControlEventValueChanged];
 
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:2.0
-                                                 target:self
-                                               selector:@selector(refreshStatus)
-                                               userInfo:nil
-                                                repeats:YES];
+    _timer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self
+                                            selector:@selector(refreshStatus)
+                                            userInfo:nil repeats:YES];
     [self refreshStatus];
 }
 
-- (void)viewWillDisappear:(BOOL)animated {
-    [super viewWillDisappear:animated];
-    [[NSUserDefaults standardUserDefaults] setObject:self.linksView.text forKey:kLinksDefaultsKey];
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self.tableView reloadData];
+    [self refreshStatus];
 }
 
-- (void)textViewDidEndEditing:(UITextView *)textView {
-    [[NSUserDefaults standardUserDefaults] setObject:textView.text forKey:kLinksDefaultsKey];
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    UIView *bar = [self.view viewWithTag:555];
+    if (bar == nil) return;
+    CGRect safe = self.view.bounds;
+    if (@available(iOS 11.0, *)) {
+        safe = self.view.safeAreaLayoutGuide.layoutFrame;
+    }
+    bar.frame = CGRectMake(0, CGRectGetMaxY(safe) - 68, self.view.bounds.size.width, 68);
+}
+
+- (void)showLog {
+    HVPNLogViewController *log = [HVPNLogViewController new];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:log];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)showLogAction:(id)sender {
+    [self showLog];
+}
+
+- (void)pingAllAction:(id)sender {
+    [self pingAll];
+}
+
+- (void)reloadAndPing {
+    [self.tableView reloadData];
+    [self pingAll];
 }
 
 #pragma mark Действия
 
-- (void)toggleConnection:(id)sender {
-    if (self.busy) return;
-    [self.view endEditing:YES];
-    [[NSUserDefaults standardUserDefaults] setObject:self.linksView.text forKey:kLinksDefaultsKey];
-
-    BOOL running = [self.lastStatus[@"running"] boolValue];
-    if (running) {
-        [self stop];
-    } else {
-        [self start];
-    }
+- (void)showAdd {
+    HVPNAddViewController *add = [HVPNAddViewController new];
+    add.onFinish = ^{ [self reloadAndPing]; };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:add];
+    [self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)start {
-    NSString *text = HVPNTrim(self.linksView.text);
-    if (text.length == 0) {
-        [self alert:@"Вставьте хотя бы одну ссылку (vless://, vmess://, trojan://, ss://, hysteria2://, tuic://) или https-подписку."];
+- (void)toggleConnection {
+    if (_busy) return;
+    BOOL running = [_lastStatus[@"running"] boolValue];
+
+    if (running) {
+        _busy = YES;
+        [self updateUI];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            HVPNSendQuick(@{@"cmd": @"stop"});
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_busy = NO;
+                [self refreshStatus];
+            });
+        });
         return;
     }
 
-    self.busy = YES;
-    [self updateButtons];
-    self.logView.text = @"Читаю подписки и запускаю ядро…";
+    HVPNStore *store = [HVPNStore shared];
+    HVPNNode *node = [store nodeAtIndex:store.selectedIndex];
+    if (node == nil) {
+        [self alert:@"Список пуст — добавьте ссылку или подписку."];
+        return;
+    }
+    if (!node.supported) {
+        [self alert:@"Эта нода использует неподдерживаемый транспорт (например xhttp). Выберите другую."];
+        return;
+    }
 
-    HVPNCollectLinks(text, 0, ^(NSArray<NSString *> *links, NSError *error) {
-        // Подписки тянутся в фоне — возвращаемся в main перед работой с UI.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (links.count == 0) {
-                self.busy = NO;
-                [self updateButtons];
-                self.logView.text = error.localizedDescription
-                    ?: @"В подписках не найдено поддерживаемых ссылок.";
-                [self alert:@"Не найдено ни одной поддерживаемой ссылки. happ:// ссылки нужно заменить на обычные (vless/vmess/trojan/ss/hysteria2)."];
-                return;
-            }
-            NSMutableDictionary *request = [@{@"cmd": @"start", @"links": links} mutableCopy];
-            request[@"options"] = @{
-                @"bypassLAN": @YES,
-                @"localDomains": @[@".local", @".lan", @".home", @".internal"]
-            };
-            self.logView.text = [NSString stringWithFormat:@"Запускаю ядро, нод: %lu…",
-                                 (unsigned long)links.count];
-            NSString *info = HVPNFormatUserinfo(HVPNLastSubscriptionInfo);
-            if (info.length) {
-                self.logView.text = [self.logView.text stringByAppendingFormat:@"\n%@", info];
-            }
-
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                NSError *sendError = nil;
-                NSDictionary *response = HVPNSend(request, &sendError);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self.busy = NO;
-                    [self updateButtons];
-                    if (response == nil) {
-                        self.logView.text = sendError.localizedDescription ?: @"Нет ответа демона";
-                        [self alert:self.logView.text];
-                    } else if (![response[@"ok"] boolValue]) {
-                        NSString *message = response[@"error"] ?: @"Не удалось подключиться";
-                        self.logView.text = message;
-                        [self alert:message];
-                    } else {
-                        self.logView.text = @"Подключено.";
-                    }
-                    [self refreshStatus];
-                });
-            });
-        });
-    });
-}
-
-- (void)stop {
-    self.busy = YES;
-    [self updateButtons];
+    _busy = YES;
+    [self updateUI];
+    NSDictionary *request = @{
+        @"cmd": @"start",
+        @"link": node.link,
+        @"options": @{
+            @"bypassLAN": @YES,
+            @"localDomains": @[@".local", @".lan", @".home", @".internal"]
+        }
+    };
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
-        NSDictionary *response = HVPNSend(@{@"cmd": @"stop"}, &error);
+        NSDictionary *response = HVPNSend(request, &error, 90);
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.busy = NO;
-            [self updateButtons];
+            self->_busy = NO;
             if (response == nil) {
-                self.logView.text = error.localizedDescription ?: @"Нет ответа демона";
-            } else {
-                self.logView.text = @"Отключено.";
+                [self alert:error.localizedDescription ?: @"Демон не отвечает"];
+            } else if (![response[@"ok"] boolValue]) {
+                [self alert:response[@"error"] ?: @"Не удалось подключиться"];
             }
             [self refreshStatus];
         });
     });
 }
 
-- (void)showLog:(id)sender {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSError *error = nil;
-        NSDictionary *response = HVPNSend(@{@"cmd": @"log"}, &error);
-        NSString *log = response[@"log"];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (log.length) {
-                self.logView.text = log;
-            } else if (response == nil) {
-                self.logView.text = error.localizedDescription ?: @"Нет ответа демона";
-            } else {
-                self.logView.text = @"Лог пуст.";
+- (void)pingAll {
+    if (_pinging) return;
+    NSArray<HVPNNode *> *nodes = [HVPNStore shared].nodes;
+    if (nodes.count == 0) {
+        [self.refreshControl endRefreshing];
+        return;
+    }
+
+    _pinging = YES;
+    _pingRemaining = nodes.count;
+    [self.tableView reloadData];
+
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(6);
+    for (NSUInteger index = 0; index < nodes.count; index++) {
+        HVPNNode *node = nodes[index];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+            NSDictionary *response = nil;
+            if (node.supported && node.server.length && node.port > 0) {
+                response = HVPNSend(@{@"cmd": @"ping",
+                                      @"server": node.server,
+                                      @"port": @(node.port)}, NULL, 15);
             }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                node.pingMs = [response[@"ok"] boolValue] ? [response[@"ms"] integerValue] : -1;
+                node.pingError = [response[@"ok"] boolValue]
+                    ? nil : (response[@"error"] ?: (response ? @"нет ответа" : @"демон не отвечает"));
+                NSIndexPath *path = [NSIndexPath indexPathForRow:(NSInteger)index inSection:0];
+                [self.tableView reloadRowsAtIndexPaths:@[path]
+                                     withRowAnimation:UITableViewRowAnimationNone];
+                dispatch_semaphore_signal(semaphore);
+                if (--self->_pingRemaining == 0) {
+                    self->_pinging = NO;
+                    [[HVPNStore shared] save];
+                    [self.refreshControl endRefreshing];
+                    [self updateUI];
+                }
+            });
         });
-    });
+    }
 }
 
-#pragma mark Статус
-
 - (void)refreshStatus {
-    if (self.polling) return;
-    self.polling = YES;
+    if (_polling) return;
+    _polling = YES;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSError *error = nil;
-        NSDictionary *response = HVPNSend(@{@"cmd": @"status"}, &error);
+        NSDictionary *response = HVPNSend(@{@"cmd": @"status"}, NULL, 8);
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.polling = NO;
+            self->_polling = NO;
             if (response == nil) {
-                self.lastStatus = nil;
-                self.statusLabel.textColor = [UIColor grayColor];
-                self.statusLabel.text = @"● демон не запущен\nпроверьте /Library/LaunchDaemons/com.happvpn.daemon.plist";
+                self->_lastStatus = nil;
+                self->_statusLabel.textColor = [UIColor grayColor];
+                self->_statusLabel.text = @"● демон не запущен\nпроверьте /Library/LaunchDaemons/com.vela.daemon.plist";
             } else {
                 NSDictionary *status = [response[@"status"] isKindOfClass:[NSDictionary class]]
                     ? response[@"status"] : @{};
-                self.lastStatus = status;
-                BOOL running = [status[@"running"] boolValue];
-                if (running) {
-                    self.statusLabel.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.1 alpha:1.0];
-                    self.statusLabel.text = [NSString stringWithFormat:
-                        @"● подключено: %@\n%@ %@ · %@ · uptime %@",
-                        status[@"node"] ?: @"?",
-                        status[@"protocol"] ?: @"",
-                        status[@"server"] ?: @"",
-                        status[@"utun"] ?: @"",
-                        HVPNUptime([status[@"uptime"] integerValue])];
+                self->_lastStatus = status;
+                if ([status[@"running"] boolValue]) {
+                    self->_statusLabel.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.15 alpha:1.0];
+                    self->_statusLabel.text = [NSString stringWithFormat:@"● %@ · %@ · %@",
+                                               status[@"node"] ?: @"?",
+                                               status[@"protocol"] ?: @"",
+                                               status[@"utun"] ?: @""];
                 } else {
-                    self.statusLabel.textColor = [UIColor darkGrayColor];
-                    self.statusLabel.text = [NSString stringWithFormat:@"○ отключено (v%@)",
-                                             response[@"version"] ?: @"?"];
+                    self->_statusLabel.textColor = [UIColor darkGrayColor];
+                    NSString *info = [HVPNStore shared].subscriptionInfo;
+                    self->_statusLabel.text = info.length
+                        ? [NSString stringWithFormat:@"○ отключено · трафик %@", info]
+                        : [NSString stringWithFormat:@"○ отключено (v%@)", response[@"version"] ?: @"?"];
                 }
             }
-            [self updateButtons];
+            [self updateUI];
         });
     });
 }
 
-- (void)updateButtons {
-    BOOL running = [self.lastStatus[@"running"] boolValue];
-    self.connectButton.enabled = !self.busy;
-    [self.connectButton setTitle:(running ? @"Отключить" : @"Подключить") forState:UIControlStateNormal];
-    self.connectButton.tintColor = running
-        ? [UIColor colorWithRed:0.7 green:0.1 blue:0.1 alpha:1.0]
-        : [UIColor colorWithRed:0.0 green:0.4 blue:0.8 alpha:1.0];
+- (void)updateUI {
+    BOOL running = [_lastStatus[@"running"] boolValue];
+    _connectButton.enabled = !_busy;
+    [_connectButton setTitle:(_busy ? @"Подождите…" : (running ? @"Отключить" : @"Подключить"))
+                    forState:UIControlStateNormal];
+    _connectButton.tintColor = running
+        ? [UIColor colorWithRed:0.72 green:0.1 blue:0.12 alpha:1.0]
+        : [UIColor colorWithRed:0.0 green:0.42 blue:0.86 alpha:1.0];
 }
 
+#pragma mark Таблица
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)[HVPNStore shared].nodes.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *identifier = @"node";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:identifier];
+    }
+    HVPNNode *node = [[HVPNStore shared] nodeAtIndex:indexPath.row];
+    cell.textLabel.text = node.name;
+    cell.textLabel.textColor = node.supported ? [UIColor blackColor] : [UIColor lightGrayColor];
+
+    NSString *detail = [NSString stringWithFormat:@"%@ · %@:%ld · %@",
+                        node.type, node.server, (long)node.port, HVPNPingText(node)];
+    cell.detailTextLabel.text = detail;
+    UIColor *detailColor = [UIColor grayColor];
+    if (!node.supported) {
+        detailColor = [UIColor lightGrayColor];
+    } else if (node.pingMs >= 0 && node.pingMs < 150) {
+        detailColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.1 alpha:1.0];
+    }
+    cell.detailTextLabel.textColor = detailColor;
+    cell.accessoryType = (indexPath.row == [HVPNStore shared].selectedIndex)
+        ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    HVPNNode *node = [[HVPNStore shared] nodeAtIndex:indexPath.row];
+    if (node == nil) return;
+    if (!node.supported) {
+        [self alert:@"Нода не поддерживается ядром (транспорт xhttp или битая ссылка)."];
+        return;
+    }
+    [HVPNStore shared].selectedIndex = indexPath.row;
+    [[HVPNStore shared] save];
+    [tableView reloadData];
+
+    if ([_lastStatus[@"running"] boolValue]) {
+        [self alert:@"Нода выбрана. Нажмите «Отключить», затем «Подключить», чтобы применить."];
+    }
+}
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    return YES;
+}
+
+- (void)tableView:(UITableView *)tableView
+commitEditingStyle:(UITableViewCellEditingStyle)editingStyle
+forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (editingStyle != UITableViewCellEditingStyleDelete) return;
+    [[HVPNStore shared] removeNodeAtIndex:indexPath.row];
+    [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+    [tableView reloadData];
+}
+
+#pragma mark Прочее
+
 - (void)alert:(NSString *)message {
-    UIAlertController *controller = [UIAlertController alertControllerWithTitle:@"HappVPN"
+    UIAlertController *controller = [UIAlertController alertControllerWithTitle:@"Vela"
                                                                         message:message
                                                                  preferredStyle:UIAlertControllerStyleAlert];
     [controller addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -550,16 +623,18 @@ static NSString *HVPNUptime(NSInteger seconds) {
 
 #pragma mark - AppDelegate
 
-@interface HVPNAppDelegate : UIResponder <UIApplicationDelegate>
+@interface VelaAppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @end
 
-@implementation HVPNAppDelegate
+@implementation VelaAppDelegate
 
 - (BOOL)application:(UIApplication *)application
 didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    [[HVPNStore shared] load];
+
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    HVPNViewController *root = [HVPNViewController new];
+    HVPNNodesViewController *root = [HVPNNodesViewController new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:root];
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
@@ -570,6 +645,6 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        return UIApplicationMain(argc, argv, nil, @"HVPNAppDelegate");
+        return UIApplicationMain(argc, argv, nil, @"VelaAppDelegate");
     }
 }

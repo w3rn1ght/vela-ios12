@@ -3,21 +3,21 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>HappVPN</string>
+	<string>Vela</string>
 	<key>CFBundleExecutable</key>
-	<string>HappVPN</string>
+	<string>Vela</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.happvpn.app</string>
+	<string>com.vela.vpn</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>HappVPN</string>
+	<string>Vela</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.1</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.1</string>
+	<string>0.2.0</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>MinimumOSVersion</key>
@@ -37,5 +37,35 @@
 	</array>
 	<key>UIStatusBarStyle</key>
 	<string>UIStatusBarStyleDefault</string>
+	<key>CFBundleIconFiles</key>
+	<array>
+		<string>AppIcon60x60</string>
+		<string>AppIcon76x76</string>
+	</array>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleIcons~ipad</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+				<string>AppIcon76x76</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
 </dict>
 </plist>
