@@ -30,8 +30,25 @@ jobs:
           chmod +x scripts/build-core.sh
           ./scripts/build-core.sh
 
+      - name: Parser tests
+        run: |
+          chmod +x scripts/run-parser-tests.sh
+          ./scripts/run-parser-tests.sh
+
       - name: Build .deb
         run: make package
+
+      - name: Inspect binaries
+        run: |
+          echo "--- core ---"
+          file layout/usr/libexec/happvpn/sing-box
+          vtool -show-build layout/usr/libexec/happvpn/sing-box || true
+          echo "--- daemon ---"
+          file .theos/obj/arm64/happvpnd
+          echo "--- deb ---"
+          ls -lh packages/
+          dpkg-deb -I packages/*.deb 2>/dev/null || true
+          dpkg-deb -c packages/*.deb 2>/dev/null | sed -n '1,40p' || true
 
       - uses: actions/upload-artifact@v4
         with:
