@@ -48,5 +48,9 @@ before-all::
 		./scripts/build-core.sh; \
 	fi
 
+# Git на Windows не сохраняет exec-бит, а dpkg без него пакет не соберёт.
+before-package::
+	@chmod 755 layout/DEBIAN/postinst layout/DEBIAN/postrm scripts/*.sh 2>/dev/null || true
+
 after-install::
 	install.exec "launchctl unload /Library/LaunchDaemons/com.happvpn.daemon.plist 2>/dev/null; launchctl load /Library/LaunchDaemons/com.happvpn.daemon.plist; uicache -p /Applications/HappVPN.app 2>/dev/null; true"
