@@ -4,6 +4,10 @@
 и root-демон, который держит ядро [sing-box](https://github.com/SagerNet/sing-box)
 и заворачивает трафик в `utun` без `NetworkExtension`.
 
+**Готовая сборка:** https://github.com/w3rn1ght/happvpn-ios12/releases/tag/v0.1.0
+(`com.happvpn.jb_0.1.0_iphoneos-arm.deb`, собрана GitHub Actions из этого кода,
+все бинари arm64 / platform ios / minos 12.0).
+
 ```
 [HappVPN.app]  --unix socket-->  [happvpnd]  --fork-->  [sing-box]
                                      |                      |
