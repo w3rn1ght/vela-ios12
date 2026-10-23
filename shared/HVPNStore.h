@@ -40,6 +40,14 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)clearDiagnostics;
 - (HVPNNode *_Nullable)nodeAtIndex:(NSInteger)index;
 
+/// HWID, который уходит в заголовке x-hwid (хранится в NSUserDefaults).
++ (NSString *)currentHWID;
++ (void)setHWID:(NSString *)hwid;
++ (void)resetHWID;
+
+/// Файл с отчётом последней загрузки подписки (для `cat` по SSH).
+@property (nonatomic, readonly) NSString *diagnosticsPath;
+
 @end
 
 NS_ASSUME_NONNULL_END

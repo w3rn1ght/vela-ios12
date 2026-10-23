@@ -158,6 +158,26 @@
     }
 }
 
+- (NSString *)diagnosticsPath {
+    return [HVPNStateDir stringByAppendingPathComponent:@"last-subscription.txt"];
+}
+
+/// Отчёт в файл — чтобы можно было прислать `cat` по SSH, даже если экран не видно.
+- (void)writeReport {
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSMutableString *text = [NSMutableString string];
+    [text appendFormat:@"%@  hwid=%@  нод=%@\n",
+     [formatter stringFromDate:[NSDate date]], HVPNStoreHWID(),
+     @(_nodes.count)];
+    @synchronized (_diagnostics) {
+        for (NSString *line in _diagnostics) [text appendFormat:@"%@\n", line];
+    }
+    [text writeToFile:self.diagnosticsPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0600}
+                                     ofItemAtPath:self.diagnosticsPath error:NULL];
+}
+
 - (void)log:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
@@ -179,6 +199,20 @@ static NSString *HVPNStoreHWID(void) {
         [defaults setObject:hwid forKey:@"VelaHWID"];
     }
     return hwid;
+}
+
++ (NSString *)currentHWID {
+    return HVPNStoreHWID();
+}
+
++ (void)setHWID:(NSString *)hwid {
+    NSString *value = [hwid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (value.length == 0) return;
+    [[NSUserDefaults standardUserDefaults] setObject:value forKey:@"VelaHWID"];
+}
+
++ (void)resetHWID {
+    [[NSUserDefaults standardUserDefaults] setObject:[[NSUUID UUID] UUIDString] forKey:@"VelaHWID"];
 }
 
 static NSString *HVPNStoreDeviceModel(void) {
@@ -268,7 +302,14 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
         [self log:@"итог: +%lu нод (всего %lu, из них поддерживаемых %lu)",
               (unsigned long)added, (unsigned long)_nodes.count, (unsigned long)supported];
 
+        if (placeholders > 0) {
+            [self log:@"[!] HWID устройства: %@", HVPNStoreHWID()];
+            [self log:@"[!] 0.0.0.0:1 — заглушки панели. Обычно это лимит устройств: "
+                       @"удалите лишние в кабинете или введите рабочий HWID в настройках (⚙)."];
+        }
+
         [self save];
+        [self writeReport];
 
         NSError *error = nil;
         if (added == 0) {

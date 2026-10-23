@@ -240,6 +240,148 @@ static NSString *HVPNPingText(HVPNNode *node) {
 
 @end
 
+#pragma mark - Настройки (HWID)
+
+@interface HVPNSettingsViewController : UIViewController
+@end
+
+@implementation HVPNSettingsViewController {
+    UILabel *_hwidLabel;
+    UILabel *_statusLabel;
+    UITextField *_hwidField;
+    UIActivityIndicatorView *_spinner;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Настройки";
+    self.view.backgroundColor = [UIColor groupTableViewBackgroundColor];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonItemStyleDone
+                                                      target:self action:@selector(close)];
+
+    UIScrollView *scroll = [UIScrollView new];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.alwaysBounceVertical = YES;
+    [self.view addSubview:scroll];
+
+    UIStackView *stack = [UIStackView new];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 12;
+    [scroll addSubview:stack];
+
+    UILabel *caption = [UILabel new];
+    caption.text = @"HWID устройства — заголовок x-hwid, по нему панель привязывает подписку к телефону. "
+                   @"Если на подписке лимит устройств, панель отдаёт заглушки 0.0.0.0:1.";
+    caption.numberOfLines = 0;
+    caption.font = [UIFont systemFontOfSize:13];
+    [stack addArrangedSubview:caption];
+
+    _hwidLabel = [UILabel new];
+    _hwidLabel.font = [UIFont fontWithName:@"Menlo" size:12] ?: [UIFont systemFontOfSize:12];
+    _hwidLabel.numberOfLines = 0;
+    _hwidLabel.text = [NSString stringWithFormat:@"текущий: %@", [HVPNStore currentHWID]];
+    [stack addArrangedSubview:_hwidLabel];
+
+    _hwidField = [UITextField new];
+    _hwidField.placeholder = @"вставить HWID другого устройства";
+    _hwidField.font = [UIFont fontWithName:@"Menlo" size:12] ?: [UIFont systemFontOfSize:12];
+    _hwidField.borderStyle = UITextBorderStyleRoundedRect;
+    _hwidField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _hwidField.autocorrectionType = UITextAutocorrectionTypeNo;
+    _hwidField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    [stack addArrangedSubview:_hwidField];
+
+    UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
+    [apply setTitle:@"Применить этот HWID" forState:UIControlStateNormal];
+    [apply addTarget:self action:@selector(applyHWID) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:apply];
+
+    UIButton *fresh = [UIButton buttonWithType:UIButtonTypeSystem];
+    [fresh setTitle:@"Сгенерировать новый HWID" forState:UIControlStateNormal];
+    [fresh addTarget:self action:@selector(resetHWID) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:fresh];
+
+    UIButton *refresh = [UIButton buttonWithType:UIButtonTypeSystem];
+    [refresh setTitle:@"Обновить подписку" forState:UIControlStateNormal];
+    [refresh addTarget:self action:@selector(refreshSubscription) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:refresh];
+
+    _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleGray];
+    _spinner.hidesWhenStopped = YES;
+    [stack addArrangedSubview:_spinner];
+
+    _statusLabel = [UILabel new];
+    _statusLabel.numberOfLines = 0;
+    _statusLabel.font = [UIFont systemFontOfSize:12];
+    _statusLabel.textColor = [UIColor darkGrayColor];
+    _statusLabel.text = [NSString stringWithFormat:@"отчёт: %@", [HVPNStore shared].diagnosticsPath];
+    [stack addArrangedSubview:_statusLabel];
+
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [scroll.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor],
+
+        [stack.topAnchor constraintEqualToAnchor:scroll.topAnchor constant:16],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.leadingAnchor constant:16],
+        [stack.trailingAnchor constraintEqualToAnchor:scroll.trailingAnchor constant:-16],
+        [stack.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor constant:-16],
+        [stack.widthAnchor constraintEqualToAnchor:scroll.widthAnchor constant:-32]
+    ]];
+}
+
+- (void)close {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)applyHWID {
+    NSString *text = _hwidField.text;
+    if (text.length == 0) return;
+    [HVPNStore setHWID:text];
+    _hwidField.text = @"";
+    _hwidLabel.text = [NSString stringWithFormat:@"текущий: %@", [HVPNStore currentHWID]];
+    _statusLabel.text = @"HWID применён. Нажмите «Обновить подписку».";
+    [self.view endEditing:YES];
+}
+
+- (void)resetHWID {
+    [HVPNStore resetHWID];
+    _hwidLabel.text = [NSString stringWithFormat:@"текущий: %@", [HVPNStore currentHWID]];
+    _statusLabel.text = @"Сгенерирован новый HWID. Нажмите «Обновить подписку».";
+}
+
+- (void)refreshSubscription {
+    NSString *url = [HVPNStore shared].subscriptionURL;
+    if (url.length == 0) {
+        _statusLabel.text = @"Сначала добавьте подписку через «＋».";
+        return;
+    }
+    [_spinner startAnimating];
+    _statusLabel.text = @"Запрашиваю подписку…";
+    __weak HVPNSettingsViewController *weakSelf = self;
+    [[HVPNStore shared] addFromText:url completion:^(NSUInteger added, NSError *error) {
+        HVPNSettingsViewController *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        [strongSelf->_spinner stopAnimating];
+        NSMutableString *report = [NSMutableString string];
+        NSArray<NSString *> *diagnostics = [HVPNStore shared].diagnostics;
+        for (NSString *line in diagnostics) {
+            [report appendFormat:@"%@\n", line];
+            if (report.length > 900) break;
+        }
+        strongSelf->_statusLabel.text = [NSString stringWithFormat:@"%@\n%@",
+                                         error.localizedDescription ?: [NSString stringWithFormat:@"+%lu нод", (unsigned long)added],
+                                         report];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"VelaNodesChanged" object:nil];
+    }];
+}
+
+@end
+
 #pragma mark - Лог
 
 @interface HVPNLogViewController : UIViewController
@@ -316,12 +458,21 @@ static NSString *HVPNPingText(HVPNNode *node) {
     self.tableView.rowHeight = 58;
     self.tableView.tableFooterView = [UIView new];
 
-    self.navigationItem.rightBarButtonItem =
+    UIBarButtonItem *addItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
                                                       target:self action:@selector(showAdd)];
+    UIBarButtonItem *gearItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"⚙" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(showSettings)];
+    self.navigationItem.rightBarButtonItems = @[addItem, gearItem];
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"Лог" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(showLogAction:)];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(nodesChanged)
+                                                 name:@"VelaNodesChanged"
+                                               object:nil];
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 56)];
     _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, header.bounds.size.width - 32, 44)];
@@ -406,6 +557,20 @@ static NSString *HVPNPingText(HVPNNode *node) {
     add.onFinish = ^{ [self reloadAndPing]; };
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:add];
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)showSettings {
+    HVPNSettingsViewController *settings = [HVPNSettingsViewController new];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:settings];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)nodesChanged {
+    [self.tableView reloadData];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (void)toggleConnection {
