@@ -115,6 +115,21 @@ static NSString *HVPNFirst(NSDictionary *q, NSArray<NSString *> *keys) {
     return nil;
 }
 
+// sing-box ждёт base64url без паддинга; панели иногда отдают обычный base64,
+// а `+` в query легко превращается в пробел. Иначе ключ REALITY «не тот».
+static NSString *HVPNNormalizeKey(NSString *key) {
+    if (key.length == 0) return @"";
+    NSMutableString *s = [key mutableCopy];
+    NSRange all = NSMakeRange(0, s.length);
+    [s replaceOccurrencesOfString:@" " withString:@"+" options:0 range:all];
+    all = NSMakeRange(0, s.length);
+    [s replaceOccurrencesOfString:@"+" withString:@"-" options:0 range:all];
+    all = NSMakeRange(0, s.length);
+    [s replaceOccurrencesOfString:@"/" withString:@"_" options:0 range:all];
+    while ([s hasSuffix:@"="]) [s deleteCharactersInRange:NSMakeRange(s.length - 1, 1)];
+    return s;
+}
+
 NSMutableDictionary *HVPNTLSDict(NSDictionary<NSString *, NSString *> *q, NSString *fallbackSNI) {
     NSString *security = q[@"security"].lowercaseString;
     BOOL tlsOn = [security isEqualToString:@"tls"] || [security isEqualToString:@"reality"] ||
@@ -146,12 +161,22 @@ NSMutableDictionary *HVPNTLSDict(NSDictionary<NSString *, NSString *> *q, NSStri
     NSString *fp = HVPNFirst(q, @[@"fp", @"fingerprint"]);
     if (fp.length) tls[@"utls"] = @{@"enabled": @YES, @"fingerprint": fp};
 
-    if ([security isEqualToString:@"reality"] || q[@"pbk"].length) {
+    if ([security isEqualToString:@"reality"] || q[@"pbk"].length || q[@"publicKey"].length) {
         NSMutableDictionary *reality = [NSMutableDictionary dictionary];
         reality[@"enabled"] = @YES;
-        reality[@"public_key"] = q[@"pbk"] ?: @"";
+        reality[@"public_key"] = HVPNNormalizeKey(q[@"pbk"] ?: q[@"publicKey"] ?: @"");
         if (q[@"sid"].length) reality[@"short_id"] = q[@"sid"];
         tls[@"reality"] = reality;
+
+        // REALITY без uTLS не проходит проверку сервера: подменять отпечаток
+        // ClientHello обязательно. Если панель не дала fp — берём chrome.
+        NSMutableDictionary *utls = [tls[@"utls"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        utls[@"enabled"] = @YES;
+        if (![utls[@"fingerprint"] isKindOfClass:[NSString class]] ||
+            [utls[@"fingerprint"] length] == 0) {
+            utls[@"fingerprint"] = @"chrome";
+        }
+        tls[@"utls"] = utls;
     }
     return tls;
 }

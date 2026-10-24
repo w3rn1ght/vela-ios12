@@ -344,6 +344,25 @@ static NSString *HVPNPrimaryInterface(void) {
             }
         }
 
+        // Диагностика: что именно уходит в ядро (без uuid и паролей).
+        NSDictionary *ob = proxy.outbound;
+        NSDictionary *tlsOpt = [ob[@"tls"] isKindOfClass:[NSDictionary class]]
+            ? ob[@"tls"] : nil;
+        NSDictionary *realityOpt = [tlsOpt[@"reality"] isKindOfClass:[NSDictionary class]]
+            ? tlsOpt[@"reality"] : nil;
+        NSDictionary *utlsOpt = [tlsOpt[@"utls"] isKindOfClass:[NSDictionary class]]
+            ? tlsOpt[@"utls"] : nil;
+        NSDictionary *transportOpt = [ob[@"transport"] isKindOfClass:[NSDictionary class]]
+            ? ob[@"transport"] : nil;
+        NSLog(@"[velad] outbound: %@ %@:%ld flow=%@ tls=%@ sni=%@ fp=%@ reality=%@ pbk=%lu sid=%lu transport=%@",
+              ob[@"type"] ?: @"?", proxy.server, (long)proxy.port, ob[@"flow"] ?: @"-",
+              [tlsOpt[@"enabled"] boolValue] ? @"on" : @"off",
+              tlsOpt[@"server_name"] ?: @"-", utlsOpt[@"fingerprint"] ?: @"-",
+              [realityOpt[@"enabled"] boolValue] ? @"on" : @"off",
+              (unsigned long)[realityOpt[@"public_key"] length],
+              (unsigned long)[realityOpt[@"short_id"] length],
+              transportOpt[@"type"] ?: @"tcp");
+
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:kBaseDir withIntermediateDirectories:YES
                        attributes:@{NSFilePosixPermissions: @0755} error:NULL];

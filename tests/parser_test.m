@@ -40,6 +40,17 @@ int main(void) {
         NSDictionary *tls = vless.outbound[@"tls"];
         expect([tls[@"server_name"] isEqualToString:@"www.microsoft.com"], @"sni");
         expect([tls[@"reality"][@"short_id"] isEqualToString:@"ab12"], @"reality short_id");
+        expect([tls[@"utls"][@"enabled"] boolValue], @"reality forces utls");
+        expect([tls[@"utls"][@"fingerprint"] isEqualToString:@"chrome"], @"utls fingerprint present");
+
+        printf("reality without fp and with base64 key\n");
+        HVPNProxy *noFP = parse(@"vless://11111111-2222-3333-4444-555555555555@reality.example.com:443"
+                                @"?security=reality&sni=www.microsoft.com"
+                                @"&pbk=ab%2Bcd/ef%3D%3D&sid=ab12&type=tcp#no-fp");
+        expect(noFP != nil, @"parsed without fp");
+        NSDictionary *noFPtls = noFP.outbound[@"tls"];
+        expect([noFPtls[@"utls"][@"fingerprint"] isEqualToString:@"chrome"], @"default utls chrome");
+        expect([noFPtls[@"reality"][@"public_key"] isEqualToString:@"ab-cd_ef"], @"pbk normalized to base64url");
 
         printf("vless + ws\n");
         HVPNProxy *ws = parse(@"vless://11111111-2222-3333-4444-555555555555@[2001:db8::1]:8443"

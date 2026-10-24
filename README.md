@@ -22,6 +22,21 @@
 
 ---
 
+## Что нового в 0.2.10
+
+По ядру: `ERROR inbound/tun[tun-in]: reality verification failed` — сеть и
+маршруты тут ни при чём, падает TLS-слой REALITY.
+
+- **REALITY теперь всегда включает uTLS.** REALITY в sing-box работает только
+  через uTLS (подмена отпечатка ClientHello); раньше `utls` добавлялся лишь
+  когда в ссылке был `fp`. Если `fp` нет — подставляется `chrome`.
+- **Ключ `pbk` приводится к base64url без паддинга.** Панели иногда отдают
+  обычный base64, где `+`/`/`/`=` sing-box не понимает как ключ REALITY
+  (получается «чужой» ключ → verification failed).
+- Поддержан вариант `publicKey` (Xray-JSON).
+- В `daemon.log` добавлена строка `outbound:` — тип, адрес, flow, sni, fp,
+  reality on/off и длина ключа: по ней сразу видно, что уходит в ядро.
+
 ## Что нового в 0.2.9
 
 По логу ядра (`inbound/tun ... -> outbound/shadowsocks[proxy]: 1.1.1.1:80`)
