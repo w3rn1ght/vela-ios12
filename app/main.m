@@ -11,6 +11,8 @@
 #include <sys/time.h>
 
 #import "HVPNConfig.h"
+#include <netdb.h>
+#include <arpa/inet.h>
 #import "HVPNLinkParser.h"
 #import "HVPNPaths.h"
 #import "HVPNStore.h"
@@ -409,6 +411,7 @@ static NSString *HVPNPingText(HVPNNode *node) {
 
 @implementation HVPNLogViewController {
     UITextView *_textView;
+    UIBarButtonItem *_youtubeItem;
 }
 
 - (void)viewDidLoad {
@@ -418,6 +421,11 @@ static NSString *HVPNPingText(HVPNNode *node) {
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                                                       target:self action:@selector(close)];
+    // Проверка «а проходит ли YouTube через туннель»: DNS, HTTP и Innertube.
+    _youtubeItem = [[UIBarButtonItem alloc] initWithTitle:@"YouTube"
+                                                    style:UIBarButtonItemStylePlain
+                                                   target:self action:@selector(checkYouTube)];
+    self.navigationItem.leftBarButtonItem = _youtubeItem;
 
     _textView = [UITextView new];
     _textView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -486,6 +494,106 @@ static NSString *HVPNPingText(HVPNNode *node) {
 #pragma mark - Список нод
 
 @interface HVPNNodesViewController : UITableViewController
+
+- (void)appendLogText:(NSString *)text {
+    _textView.text = [_textView.text stringByAppendingString:text];
+    NSRange end = NSMakeRange(_textView.text.length, 0);
+    [_textView scrollRangeToVisible:end];
+}
+
+- (NSString *)probeURL:(NSString *)urlString
+               session:(NSURLSession *)session
+                  post:(NSString *)body {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    request.timeoutInterval = 15;
+    [request setValue:@"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       @"(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+   forHTTPHeaderField:@"User-Agent"];
+    if (body.length) {
+        request.HTTPMethod = @"POST";
+        [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        request.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
+    __block NSData *data = nil;
+    __block NSHTTPURLResponse *http = nil;
+    __block NSError *error = nil;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    [[session dataTaskWithRequest:request
+               completionHandler:^(NSData *body2, NSURLResponse *raw, NSError *taskError) {
+        data = body2;
+        error = taskError;
+        if ([raw isKindOfClass:[NSHTTPURLResponse class]]) http = (NSHTTPURLResponse *)raw;
+        dispatch_semaphore_signal(semaphore);
+    }] resume];
+    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+
+    NSString *host = request.URL.host ?: urlString;
+    if (error) {
+        return [NSString stringWithFormat:@"%@: ошибка — %@\n", host, error.localizedDescription];
+    }
+    NSString *head = @"";
+    if (data.length) {
+        NSUInteger take = MIN((NSUInteger)80, data.length);
+        head = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, take)]
+                                     encoding:NSUTF8StringEncoding] ?: @"";
+        head = [head stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    }
+    return [NSString stringWithFormat:@"%@: HTTP %ld, %lu Б%@\n", host, (long)http.statusCode,
+            (unsigned long)data.length,
+            (http.statusCode >= 400 && head.length) ? [@" — " stringByAppendingString:head] : @""];
+}
+
+- (void)checkYouTube {
+    _youtubeItem.enabled = NO;
+    [self appendLogText:@"\n— проверка YouTube —\n"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *out = [NSMutableString string];
+
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = NULL;
+        if (getaddrinfo("www.youtube.com", "443", &hints, &res) == 0) {
+            NSMutableArray *v4 = [NSMutableArray array];
+            NSMutableArray *v6 = [NSMutableArray array];
+            for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+                char buf[INET6_ADDRSTRLEN] = {0};
+                if (p->ai_family == AF_INET) {
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)p->ai_addr)->sin_addr, buf, sizeof(buf));
+                    [v4 addObject:@(buf)];
+                } else if (p->ai_family == AF_INET6) {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)p->ai_addr)->sin6_addr, buf, sizeof(buf));
+                    [v6 addObject:@(buf)];
+                }
+            }
+            freeaddrinfo(res);
+            [out appendFormat:@"DNS www.youtube.com: A=%lu AAAA=%lu", (unsigned long)v4.count,
+                              (unsigned long)v6.count];
+            if (v4.count) [out appendFormat:@"\n  A: %@", [v4 componentsJoinedByString:@", "]];
+            if (v6.count) [out appendFormat:@"\n  AAAA: %@", [v6 componentsJoinedByString:@", "]];
+            [out appendString:@"\n"];
+        } else {
+            [out appendString:@"DNS www.youtube.com: не разрешился\n"];
+        }
+
+        NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        config.timeoutIntervalForRequest = 15;
+        NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+        [out appendString:[self probeURL:@"https://www.youtube.com/generate_204" session:session post:nil]];
+        [out appendString:[self probeURL:@"https://i.ytimg.com/generate_204" session:session post:nil]];
+        NSString *body = @"{\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"2.20240101.00.00\",\"hl\":\"en\",\"gl\":\"US\"}},\"browseId\":\"FEwhat_to_watch\"}";
+        [out appendString:[self probeURL:@"https://www.youtube.com/youtubei/v1/browse?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+                                 session:session post:body]];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_youtubeItem.enabled = YES;
+            [self appendLogText:out];
+        });
+    });
+}
+
 @end
 
 @implementation HVPNNodesViewController {

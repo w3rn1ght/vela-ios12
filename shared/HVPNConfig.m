@@ -1,6 +1,6 @@
 #import "HVPNConfig.h"
 
-NSString *const HVPNVersionString = @"0.2.16";
+NSString *const HVPNVersionString = @"0.2.17";
 
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *opts = options ?: @{};
@@ -71,7 +71,11 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
             @{@"type": @"udp", @"tag": @"local", @"server": dnsLocal, @"detour": @"direct"}
         ],
         @"final": @"remote",
-        @"strategy": @"prefer_ipv4"
+        // ipv4_only: приложениям не отдаём AAAA-записи. Иначе iOS уводит их в IPv6,
+        // а IPv6 через наш tun не ходит (маршруты ::/1 не ставим) — получаются
+        // «висящие» соединения: YouTube/Opaline именно так и отваливались.
+        // Заодно закрывает утечку мимо туннеля.
+        @"strategy": opts[@"dnsStrategy"] ?: @"ipv4_only"
     } mutableCopy];
     NSArray *localDomains = (NSArray *)opts[@"localDomains"];
     if ([localDomains isKindOfClass:[NSArray class]] && localDomains.count) {

@@ -10,7 +10,12 @@ if [ -x /sbin/route ]; then
 	done
 fi
 
-rm -rf /var/mobile/Library/Vela /var/mobile/Library/Logs/Vela
+# nodes.json — данные пользователя, а не файлы пакета: dpkg вызывает postrm и при
+# обновлении ($1 = upgrade), и при обычном удалении. Стираем только при purge,
+# иначе после каждого dpkg -i список серверов приходится вводить заново.
+if [ "$1" = "purge" ]; then
+	rm -rf /var/mobile/Library/Vela /var/mobile/Library/Logs/Vela
+fi
 
 if [ -x /usr/bin/uicache ]; then
 	uicache -p /Applications/Vela.app 2>/dev/null || true
