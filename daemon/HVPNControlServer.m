@@ -82,6 +82,11 @@ static NSDictionary *HVPNHandleRequest(NSDictionary *request) {
         result[@"port"] = @(port);
         return result;
     }
+    if ([cmd isEqualToString:@"probe"]) {
+        NSMutableDictionary *result = [[tunnel probe] mutableCopy];
+        result[@"version"] = HVPNVersionString;
+        return result;
+    }
     if ([cmd isEqualToString:@"stop"]) {
         NSMutableDictionary *result = [[tunnel stop] mutableCopy];
         result[@"version"] = HVPNVersionString;

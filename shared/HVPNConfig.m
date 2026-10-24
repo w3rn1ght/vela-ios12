@@ -1,24 +1,29 @@
 #import "HVPNConfig.h"
 
-NSString *const HVPNVersionString = @"0.2.7";
+NSString *const HVPNVersionString = @"0.2.8";
 
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *opts = options ?: @{};
     NSString *dnsRemote = opts[@"dnsRemote"] ?: @"https://1.1.1.1/dns-query";
     NSString *dnsLocal = opts[@"dnsLocal"] ?: @"223.5.5.5";
     NSNumber *bypassLAN = opts[@"bypassLAN"] ?: @YES;
-    NSNumber *mtu = opts[@"mtu"] ?: @1500;
+    NSNumber *mtu = opts[@"mtu"] ?: @1400;
     NSString *logLevel = opts[@"logLevel"] ?: @"info";
     NSString *logPath = opts[@"logPath"];
 
     NSMutableDictionary *outbound = [proxy.outbound mutableCopy];
     outbound[@"tag"] = @"proxy";
+    // Прокси-соединение жёстко привязываем к физическому интерфейсу: иначе
+    // его собственный трафик попадает в наш же tun (петля) и «ничего не грузится».
+    NSString *bindInterface = opts[@"bindInterface"];
+    if ([bindInterface isKindOfClass:[NSString class]] && bindInterface.length > 0) {
+        outbound[@"bind_interface"] = bindInterface;
+    }
 
     // На iOS route.auto_detect_interface не работает, поэтому direct-исходящие
     // (локальный DNS, bypass-домены, приватные сети) жёстко привязываем к
     // физическому интерфейсу — иначе они уйдут в наш же tun (петля).
     NSMutableDictionary *direct = [@{@"type": @"direct", @"tag": @"direct"} mutableCopy];
-    NSString *bindInterface = opts[@"bindInterface"];
     if ([bindInterface isKindOfClass:[NSString class]] && bindInterface.length > 0) {
         direct[@"bind_interface"] = bindInterface;
     }
@@ -84,9 +89,9 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
         @"route": @{
             @"rules": rules,
             @"final": @"proxy",
-            // Ядро само привязывается к физическому интерфейсу — это защита от петли
-            // «прокси-соединение уходит в собственный tun».
-            @"auto_detect_interface": @YES
+            // Когда интерфейс известен, привязываем исходящие сами (см. выше),
+            // а автоопределение выключаем: на iOS оно иногда выбирает наш же utun.
+            @"auto_detect_interface": (bindInterface.length > 0) ? @NO : @YES
         },
         @"experimental": @{@"cache_file": @{@"enabled": @NO}}
     } mutableCopy];

@@ -22,6 +22,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSDictionary *)stop;
 - (NSDictionary *)status;
 
+/// Сквозная проверка: пропускает ли туннель реальный трафик ({ok, ms, error}).
+- (NSDictionary *)probe;
+
 /// Последние строки лога ядра (для показа в приложении).
 - (NSString *)coreLog;
 

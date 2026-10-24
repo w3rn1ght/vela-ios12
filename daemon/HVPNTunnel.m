@@ -114,6 +114,95 @@ static NSString *HVPNNextTunName(void) {
 
 // en0 (Wi-Fi) или pdp_ip0 (LTE) — интерфейс, через который идёт default-маршрут.
 // SystemConfiguration на iOS недоступен, поэтому берём индекс из таблицы маршрутов.
+
+// DNS физической сети: без него «local»-сервер может быть недоступен.
+static NSString *HVPNSystemDNS(void) {
+    NSString *text = [NSString stringWithContentsOfFile:@"/etc/resolv.conf"
+                                               encoding:NSUTF8StringEncoding
+                                                  error:NULL];
+    if (text.length == 0) return nil;
+    NSCharacterSet *spaces = [NSCharacterSet whitespaceCharacterSet];
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]]) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:spaces];
+        if (![trimmed hasPrefix:@"nameserver"]) continue;
+        NSArray<NSString *> *parts = [trimmed componentsSeparatedByCharactersInSet:spaces];
+        if (parts.count >= 2 && [parts[1] rangeOfString:@"."].location != NSNotFound) {
+            return parts[1];
+        }
+    }
+    return nil;
+}
+
+// Сквозная проверка туннеля. connect() сам по себе ничего не доказывает: gvisor
+// принимает TCP-хендшейк сразу, даже если прокси мёртв. Поэтому отправляем
+// HTTP-запрос и ждём ответ: живой туннель отдаст "HTTP/...", мёртвый — EOF.
+static NSDictionary *HVPNRunProbe(NSTimeInterval timeout) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    inet_pton(AF_INET, "1.1.1.1", &addr.sin_addr);
+
+    NSDate *started = [NSDate date];
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return @{@"ok": @NO, @"error": HVPNErrnoString()};
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc != 0 && errno != EINPROGRESS) {
+        NSString *error = HVPNErrnoString();
+        close(fd);
+        return @{@"ok": @NO, @"error": error};
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = (time_t)timeout;
+    tv.tv_usec = 0;
+    if (rc != 0) {
+        int ready = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (ready <= 0) {
+            close(fd);
+            return @{@"ok": @NO, @"error": ready == 0 ? @"таймаут подключения" : HVPNErrnoString()};
+        }
+        int soError = 0;
+        socklen_t len = sizeof(soError);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len) != 0 || soError != 0) {
+            close(fd);
+            return @{@"ok": @NO,
+                     @"error": [NSString stringWithUTF8String:strerror(soError)] ?: @"connect"};
+        }
+    }
+
+    const char *request = "GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
+    if (write(fd, request, strlen(request)) <= 0) {
+        NSString *error = HVPNErrnoString();
+        close(fd);
+        return @{@"ok": @NO, @"error": error};
+    }
+
+    char buf[64];
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval rt = tv;
+    int ready = select(fd + 1, &wfds, NULL, NULL, &rt);
+    ssize_t got = (ready > 0) ? read(fd, buf, sizeof(buf)) : ready;
+    close(fd);
+
+    NSInteger ms = (NSInteger)([[NSDate date] timeIntervalSinceDate:started] * 1000);
+    if (got > 0) return @{@"ok": @YES, @"ms": @(ms)};
+    if (got == 0) {
+        return @{@"ok": @NO, @"ms": @(ms),
+                 @"error": @"ядро закрыло соединение — прокси не отвечает"};
+    }
+    return @{@"ok": @NO, @"ms": @(ms), @"error": @"нет ответа через туннель"};
+}
+
 static NSString *HVPNPrimaryInterface(void) {
     NSString *gateway = nil;
     unsigned index = 0;
@@ -131,6 +220,7 @@ static NSString *HVPNPrimaryInterface(void) {
     NSString *_nodeServer;
     NSString *_nodeType;
     NSDate *_startedAt;
+    NSDictionary *_lastProbe;
     NSMutableArray<NSDictionary *> *_ifaceRoutes;   // {family, dst, prefix, ifindex}
     NSMutableArray<NSArray *> *_hostRoutes;         // [family, ip, gateway]
 }
@@ -249,6 +339,8 @@ static NSString *HVPNPrimaryInterface(void) {
         }
 
         NSMutableDictionary *opts = [options mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSString *systemDNS = HVPNSystemDNS();
+        if (systemDNS.length) opts[@"dnsLocal"] = systemDNS;
         opts[@"logPath"] = kCoreLogPath;
         NSString *tunName = HVPNNextTunName();
         opts[@"interfaceName"] = tunName;
@@ -317,7 +409,9 @@ static NSString *HVPNPrimaryInterface(void) {
         // 2. Заворачиваем весь IPv4/IPv6 в tun (split default).
         [self addInterfaceRoute:AF_INET dst:@"0.0.0.0" prefix:1 ifindex:ifindex];
         [self addInterfaceRoute:AF_INET dst:@"128.0.0.0" prefix:1 ifindex:ifindex];
-        BOOL tunnelIPv6 = (serverAddresses.count > 0) && HVPNInterfaceHasIPv6(utun);
+        // IPv6 по умолчанию оставляем напрямую: если завернуть v6 в туннель без
+        // рабочего v6-транспорта, iOS решает, что сеть «мертва», и уходит на LTE.
+        BOOL tunnelIPv6 = [options[@"tunnelIPv6"] boolValue] && HVPNInterfaceHasIPv6(utun);
         if (tunnelIPv6) {
             [self addInterfaceRoute:AF_INET6 dst:@"::" prefix:1 ifindex:ifindex];
             [self addInterfaceRoute:AF_INET6 dst:@"8000::" prefix:1 ifindex:ifindex];
@@ -342,7 +436,21 @@ static NSString *HVPNPrimaryInterface(void) {
                 (unsigned long)installedRoutes, (unsigned long)expectedRoutes]];
         }
 
-        return @{@"ok": @YES, @"status": [self status]};
+        // Проверяем, что к серверу нет петли через наш же tun.
+        for (NSString *ip in serverAddresses) {
+            if (HVPNRouteInterfaceIndex(AF_INET, ip, 32) == ifindex) {
+                NSLog(@"[velad] ОШИБКА: маршрут к серверу %@ ведёт в наш tun (петля)", ip);
+            }
+        }
+
+        _lastProbe = HVPNRunProbe(6.0);
+        if ([_lastProbe[@"ok"] boolValue]) {
+            NSLog(@"[velad] проба через туннель: трафик идёт, %@ мс", _lastProbe[@"ms"]);
+        } else {
+            NSLog(@"[velad] проба через туннель: ТРАФИКА НЕТ (%@)", _lastProbe[@"error"]);
+        }
+
+        return @{@"ok": @YES, @"status": [self status], @"probe": _lastProbe ?: @{}};
     }
 }
 
@@ -379,8 +487,19 @@ static NSString *HVPNPrimaryInterface(void) {
             @"server": _nodeServer ?: @"",
             @"protocol": _nodeType ?: @"",
             @"uptime": @(uptime),
-            @"routes": @(_ifaceRoutes.count)
+            @"routes": @(_ifaceRoutes.count),
+            @"probe": _lastProbe ?: @{}
         };
+    }
+}
+
+- (NSDictionary *)probe {
+    @synchronized (self) {
+        if (_pid <= 0) return @{@"ok": @NO, @"error": @"не подключено"};
+        _lastProbe = HVPNRunProbe(6.0);
+        NSLog(@"[velad] проба через туннель: %@",
+              [_lastProbe[@"ok"] boolValue] ? _lastProbe[@"ms"] : _lastProbe[@"error"]);
+        return _lastProbe;
     }
 }
 

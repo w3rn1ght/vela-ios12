@@ -501,6 +501,9 @@ static NSString *HVPNPingText(HVPNNode *node) {
     _statusLabel.font = [UIFont systemFontOfSize:12];
     _statusLabel.text = @"Проверяю демон…";
     _statusLabel.textColor = [UIColor darkGrayColor];
+    _statusLabel.userInteractionEnabled = YES;
+    [_statusLabel addGestureRecognizer:
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(probeTapped)]];
     [header addSubview:_statusLabel];
     self.tableView.tableHeaderView = header;
 
@@ -640,6 +643,41 @@ static NSString *HVPNPingText(HVPNNode *node) {
                 [self alert:error.localizedDescription ?: @"Демон не отвечает"];
             } else if (![response[@"ok"] boolValue]) {
                 [self alert:response[@"error"] ?: @"Не удалось подключиться"];
+            } else {
+                NSDictionary *probe = response[@"probe"];
+                if ([probe isKindOfClass:[NSDictionary class]] &&
+                    !([probe[@"ok"] boolValue])) {
+                    [self alert:[NSString stringWithFormat:
+                        @"Подключено, но трафик через туннель не идёт.\n%@\n\n"
+                        @"Откройте «Журнал» — там лог ядра (sing-box).",
+                        probe[@"error"] ?: @"причина неизвестна"]];
+                }
+            }
+            [self refreshStatus];
+        });
+    });
+}
+
+// Тап по строке состояния — повторная сквозная проверка туннеля.
+- (void)probeTapped {
+    if (_busy) return;
+    if (![_lastStatus[@"running"] boolValue]) {
+        [self alert:@"Сначала подключитесь."];
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *response = HVPNSend(@{@"cmd": @"probe"}, NULL, 20);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (response == nil) {
+                [self alert:@"Демон не отвечает"];
+                return;
+            }
+            if ([response[@"ok"] boolValue]) {
+                [self alert:[NSString stringWithFormat:@"Трафик через туннель идёт (%@ мс).",
+                              response[@"ms"] ?: @"?"]];
+            } else {
+                [self alert:[NSString stringWithFormat:@"Трафика нет: %@\n\nПодробности — «Лог».",
+                              response[@"error"] ?: @"причина неизвестна"]];
             }
             [self refreshStatus];
         });
@@ -727,13 +765,26 @@ static NSString *HVPNPingText(HVPNNode *node) {
                     ? [NSString stringWithFormat:@"⚠ демон v%@ ≠ приложение v%@ — переустановите пакет\n",
                        daemonVersion, HVPNVersionString]
                     : @"";
+                NSDictionary *probe = [status[@"probe"] isKindOfClass:[NSDictionary class]]
+                    ? status[@"probe"] : nil;
+                BOOL noTraffic = probe != nil && !([probe[@"ok"] boolValue]);
                 if ([status[@"running"] boolValue]) {
+                    if (noTraffic) {
+                        self->_statusLabel.textColor = [UIColor colorWithRed:0.7 green:0.1 blue:0.1 alpha:1.0];
+                        self->_statusLabel.text = [NSString stringWithFormat:@"%@● %@ · нет трафика: %@",
+                                                   warn, status[@"node"] ?: @"?",
+                                                   probe[@"error"] ?: @"?"];
+                        [self updateUI];
+                        return;
+                    }
                     self->_statusLabel.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.15 alpha:1.0];
-                    self->_statusLabel.text = [NSString stringWithFormat:@"%@● %@ · %@ · %@",
+                    NSString *traffic = probe[@"ms"]
+                        ? [NSString stringWithFormat:@" · %@ мс", probe[@"ms"]] : @"";
+                    self->_statusLabel.text = [NSString stringWithFormat:@"%@● %@ · %@ · %@%@",
                                                warn,
                                                status[@"node"] ?: @"?",
                                                status[@"protocol"] ?: @"",
-                                               status[@"utun"] ?: @""];
+                                               status[@"utun"] ?: @"", traffic];
                 } else {
                     self->_statusLabel.textColor = versionMismatch
                         ? [UIColor colorWithRed:0.7 green:0.1 blue:0.1 alpha:1.0]
