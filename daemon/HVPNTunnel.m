@@ -480,11 +480,24 @@ static NSString *HVPNPrimaryInterface(void) {
             }
         }
 
-        _lastProbe = HVPNRunProbe(6.0);
+        _lastProbe = HVPNRunProbe(4.0);
         if ([_lastProbe[@"ok"] boolValue]) {
             NSLog(@"[velad] проба через туннель: трафик идёт, %@ мс", _lastProbe[@"ms"]);
         } else {
             NSLog(@"[velad] проба через туннель: ТРАФИКА НЕТ (%@)", _lastProbe[@"error"]);
+
+            // Частая причина у «белых списков»: самоподписанный сертификат.
+            // Пробуем один раз перезапустить ядро с insecure.
+            NSString *coreText = [[self coreLog] lowercaseString];
+            BOOL certProblem = [coreText rangeOfString:@"x509"].location != NSNotFound ||
+                               [coreText rangeOfString:@"certificate"].location != NSNotFound ||
+                               [coreText rangeOfString:@"unknown authority"].location != NSNotFound;
+            if (certProblem && ![options[@"forceInsecure"] boolValue]) {
+                NSLog(@"[velad] сертификат узла не проходит проверку — повторяю с insecure");
+                NSMutableDictionary *retry = [options mutableCopy] ?: [NSMutableDictionary dictionary];
+                retry[@"forceInsecure"] = @YES;
+                return [self startWithLinks:links options:retry];
+            }
         }
 
         return @{@"ok": @YES, @"status": [self status], @"probe": _lastProbe ?: @{}};

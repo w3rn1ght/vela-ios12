@@ -511,7 +511,10 @@ static NSString *HVPNPingText(HVPNNode *node) {
     UIBarButtonItem *gearItem =
         [[UIBarButtonItem alloc] initWithTitle:@"⚙" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(showSettings)];
-    self.navigationItem.rightBarButtonItems = @[addItem, gearItem];
+    UIBarButtonItem *autoItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"🔍" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(autoPick)];
+    self.navigationItem.rightBarButtonItems = @[addItem, gearItem, autoItem];
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"Лог" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(showLogAction:)];
@@ -683,6 +686,76 @@ static NSString *HVPNPingText(HVPNNode *node) {
                         @"Откройте «Журнал» — там лог ядра (sing-box).",
                         probe[@"error"] ?: @"причина неизвестна"]];
                 }
+            }
+            [self refreshStatus];
+        });
+    });
+}
+
+// Автоподбор: перебираем ноды с хорошим пингом, пока какая-нибудь не пропустит трафик.
+- (void)autoPick {
+    if (_busy) return;
+    NSArray<HVPNNode *> *all = [HVPNStore shared].nodes;
+    NSMutableArray<NSNumber *> *candidates = [NSMutableArray array];
+    for (NSUInteger i = 0; i < all.count; i++) {
+        HVPNNode *node = all[i];
+        if (node.supported && node.pingMs > 0) [candidates addObject:@(i)];
+    }
+    if (candidates.count == 0) {
+        [self alert:@"Сначала потяните список вниз — нужен пинг нод."];
+        return;
+    }
+    [candidates sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        HVPNNode *na = all[a.unsignedIntegerValue];
+        HVPNNode *nb = all[b.unsignedIntegerValue];
+        return [@(na.pingMs) compare:@(nb.pingMs)];
+    }];
+
+    NSUInteger limit = MIN(candidates.count, 10);
+    _busy = YES;
+    [self updateUI];
+
+    NSDictionary *options = @{@"bypassLAN": @YES,
+                              @"localDomains": @[@".local", @".lan", @".home", @".internal"]};
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSInteger found = -1;
+        NSInteger foundMs = 0;
+        NSString *lastError = nil;
+        for (NSUInteger i = 0; i < limit; i++) {
+            NSUInteger index = candidates[i].unsignedIntegerValue;
+            HVPNNode *node = all[index];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_statusLabel.textColor = [UIColor darkGrayColor];
+                self->_statusLabel.text = [NSString stringWithFormat:@"подбор %lu/%lu: %@",
+                                           (unsigned long)(i + 1), (unsigned long)limit, node.name];
+            });
+            NSDictionary *response = HVPNSend(@{@"cmd": @"start",
+                                                @"link": node.link,
+                                                @"options": options}, NULL, 90);
+            NSDictionary *probe = [response[@"probe"] isKindOfClass:[NSDictionary class]]
+                ? response[@"probe"] : nil;
+            if ([response[@"ok"] boolValue] && [probe[@"ok"] boolValue]) {
+                found = (NSInteger)index;
+                foundMs = [probe[@"ms"] integerValue];
+                break;
+            }
+            lastError = probe[@"error"] ?: response[@"error"] ?: @"нет трафика";
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_busy = NO;
+            if (found >= 0) {
+                HVPNNode *node = all[(NSUInteger)found];
+                [HVPNStore shared].selectedIndex = found;
+                [[HVPNStore shared] save];
+                [self.tableView reloadData];
+                [self alert:[NSString stringWithFormat:@"Работает: %@\nтрафик через туннель, %ld мс.",
+                             node.name, (long)foundMs]];
+            } else {
+                HVPNSendQuick(@{@"cmd": @"stop"});
+                [self alert:[NSString stringWithFormat:
+                    @"Ни одна из %lu проверенных нод не пропускает трафик.\nПоследняя причина: %@",
+                    (unsigned long)limit, lastError ?: @"неизвестна"]];
             }
             [self refreshStatus];
         });

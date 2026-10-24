@@ -97,7 +97,8 @@ static NSDictionary *HVPNHandleRequest(NSDictionary *request) {
         return @{@"ok": @YES, @"version": HVPNVersionString, @"status": [tunnel status]};
     }
     if ([cmd isEqualToString:@"log"]) {
-        return @{@"ok": @YES, @"log": [tunnel coreLog], @"status": [tunnel status]};
+        return @{@"ok": @YES, @"log": [tunnel coreLog], @"status": [tunnel status],
+                 @"version": HVPNVersionString};
     }
     return @{@"ok": @NO, @"error": [NSString stringWithFormat:@"неизвестная команда: %@", cmd ?: @"(null)"]};
 }

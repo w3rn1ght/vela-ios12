@@ -1,6 +1,6 @@
 #import "HVPNConfig.h"
 
-NSString *const HVPNVersionString = @"0.2.11";
+NSString *const HVPNVersionString = @"0.2.12";
 
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *opts = options ?: @{};
@@ -13,6 +13,18 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
 
     NSMutableDictionary *outbound = [proxy.outbound mutableCopy];
     outbound[@"tag"] = @"proxy";
+    // Узел с самоподписанным сертификатом (частый случай у «белых списков»):
+    // демон сначала пробует строгую проверку, а после ошибки сертификата
+    // перезапускает ядро с этой опцией.
+    if ([opts[@"forceInsecure"] boolValue]) {
+        NSMutableDictionary *tls = [outbound[@"tls"] isKindOfClass:[NSDictionary class]]
+            ? [outbound[@"tls"] mutableCopy] : nil;
+        if (tls != nil) {
+            tls[@"insecure"] = @YES;
+            outbound[@"tls"] = tls;
+        }
+    }
+
     // Прокси-соединение жёстко привязываем к физическому интерфейсу: иначе
     // его собственный трафик попадает в наш же tun (петля) и «ничего не грузится».
     NSString *bindInterface = opts[@"bindInterface"];
