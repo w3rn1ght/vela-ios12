@@ -473,6 +473,13 @@ static NSString *HVPNPrimaryInterface(void) {
                 (unsigned long)installedRoutes, (unsigned long)expectedRoutes]];
         }
 
+        // Пока туннель поднимался, mDNSResponder мог запомнить отрицательный ответ
+        // (в том числе для youtube.com) и потом отдавать его приложениям. Просим
+        // перечитать конфигурацию — кеш сбрасывается.
+        if (system("killall -HUP mDNSResponder >/dev/null 2>&1") == 0) {
+            NSLog(@"[velad] кеш DNS сброшен (mDNSResponder HUP)");
+        }
+
         // Проверяем, что к серверу нет петли через наш же tun.
         for (NSString *ip in serverAddresses) {
             if (HVPNRouteInterfaceIndex(AF_INET, ip, 32) == ifindex) {

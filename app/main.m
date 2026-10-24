@@ -538,6 +538,53 @@ static NSString *HVPNPingText(HVPNNode *node) {
             (http.statusCode >= 400 && head.length) ? [@" — " stringByAppendingString:head] : @""];
 }
 
+- (NSString *)dnsProbe:(NSString *)name qtype:(int)qtype {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return @"socket() не удался";
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(53);
+    inet_pton(AF_INET, "1.1.1.1", &addr.sin_addr);
+
+    uint8_t query[512];
+    NSUInteger n = 0;
+    uint16_t ident = (uint16_t)arc4random_uniform(0xffff);
+    query[n++] = (uint8_t)(ident >> 8);
+    query[n++] = (uint8_t)(ident & 0xff);
+    query[n++] = 0x01;   // RD
+    query[n++] = 0x00;
+    query[n++] = 0x00;   // QDCOUNT
+    query[n++] = 0x01;
+    for (int i = 0; i < 6; i++) query[n++] = 0;   // AN/NS/AR
+
+    for (NSString *part in [name componentsSeparatedByString:@"."]) {
+        NSData *chunk = [part dataUsingEncoding:NSUTF8StringEncoding];
+        if (chunk.length == 0 || chunk.length > 63) { close(fd); return @"плохое имя"; }
+        query[n++] = (uint8_t)chunk.length;
+        memcpy(query + n, chunk.bytes, chunk.length);
+        n += chunk.length;
+    }
+    query[n++] = 0;
+    query[n++] = (uint8_t)(qtype >> 8);
+    query[n++] = (uint8_t)(qtype & 0xff);
+    query[n++] = 0;
+    query[n++] = 1;
+
+    sendto(fd, query, n, 0, (struct sockaddr *)&addr, sizeof(addr));
+    uint8_t reply[1024];
+    ssize_t got = recv(fd, reply, sizeof(reply), 0);
+    close(fd);
+    if (got < 12) return @"нет ответа за 5 с";
+    int rcode = reply[3] & 0x0f;
+    int answers = (reply[6] << 8) | reply[7];
+    return [NSString stringWithFormat:@"rcode=%d, ответов=%d%s", rcode, answers,
+            rcode == 3 ? " (NXDOMAIN)" : (rcode == 2 ? " (SERVFAIL)" : "")];
+}
+
 - (void)checkYouTube {
     _youtubeItem.enabled = NO;
     [self appendLogText:@"\n— проверка YouTube —\n"];
@@ -572,6 +619,12 @@ static NSString *HVPNPingText(HVPNNode *node) {
             [out appendString:@"DNS www.youtube.com: не разрешился\n"];
         }
 
+        [out appendFormat:@"DNS-модуль (запрос в 1.1.1.1:53 через туннель):\n"];
+        [out appendFormat:@"  www.youtube.com A:    %@\n", [self dnsProbe:@"www.youtube.com" qtype:1]];
+        [out appendFormat:@"  www.youtube.com AAAA: %@\n", [self dnsProbe:@"www.youtube.com" qtype:28]];
+        [out appendFormat:@"  i.ytimg.com A:        %@\n", [self dnsProbe:@"i.ytimg.com" qtype:1]];
+        [out appendFormat:@"  admin.fixcord.gg A:   %@\n", [self dnsProbe:@"admin.fixcord.gg" qtype:1]];
+
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         config.timeoutIntervalForRequest = 15;
         NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
@@ -580,6 +633,23 @@ static NSString *HVPNPingText(HVPNNode *node) {
         NSString *body = @"{\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"2.20240101.00.00\",\"hl\":\"en\",\"gl\":\"US\"}},\"browseId\":\"FEwhat_to_watch\"}";
         [out appendString:[self probeURL:@"https://www.youtube.com/youtubei/v1/browse?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
                                  session:session post:body]];
+
+        // Что ядро само говорит про DNS — если транспорт падает, тут будет причина.
+        NSDictionary *logResponse = HVPNSend(@{@"cmd": @"log"}, NULL, 10);
+        NSString *coreLog = [logResponse[@"log"] isKindOfClass:[NSString class]] ? logResponse[@"log"] : nil;
+        if (coreLog.length) {
+            NSMutableArray<NSString *> *dnsLines = [NSMutableArray array];
+            for (NSString *line in [coreLog componentsSeparatedByString:@"\n"]) {
+                if ([line.lowercaseString rangeOfString:@"dns"].location != NSNotFound) {
+                    [dnsLines addObject:line];
+                }
+            }
+            [out appendFormat:@"\nядро, строки про DNS: %lu\n", (unsigned long)dnsLines.count];
+            NSUInteger take = MIN((NSUInteger)8, dnsLines.count);
+            for (NSUInteger i = dnsLines.count - take; i < dnsLines.count; i++) {
+                [out appendFormat:@"  %@\n", dnsLines[i]];
+            }
+        }
 
         dispatch_async(dispatch_get_main_queue(), ^{
             self->_youtubeItem.enabled = YES;
