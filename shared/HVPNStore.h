@@ -25,6 +25,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) NSInteger selectedIndex;      // -1 = ничего
 @property (nonatomic, copy, nullable) NSString *subscriptionURL;
 @property (nonatomic, copy, nullable) NSString *subscriptionInfo;  // трафик/срок
+@property (nonatomic, copy, nullable) NSString *lastFetchError;      // почему не скачалась подписка
 @property (nonatomic, readonly) NSArray<NSString *> *diagnostics;
 
 + (instancetype)shared;

@@ -384,6 +384,8 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
             if (placeholders > 0) {
                 message = @"Панель отдала только заглушки (0.0.0.0:1). Обычно это значит, что подписка "
                           @"не активирована, истекла или исчерпан лимит устройств.";
+            } else if (self.lastFetchError.length > 0) {
+                message = self.lastFetchError;
             } else if (happError != nil) {
                 message = [NSString stringWithFormat:@"Ссылка Happ не расшифровалась: %@",
                                                      happError.localizedDescription ?: @"причина неизвестна"];
@@ -438,27 +440,60 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
     }
 
     [self log:@"[..] %@", url.host ?: urlText];
-    __block NSData *responseData = nil;
-    __block NSHTTPURLResponse *httpResponse = nil;
-    __block NSError *responseError = nil;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
 
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
-        dataTaskWithRequest:HVPNStoreSubscriptionRequest(url)
-          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSData *responseData = nil;
+    NSHTTPURLResponse *httpResponse = nil;
+    NSError *responseError = nil;
+
+    // Две попытки: панели за DDoS-Guard иногда не отвечают с первого раза, а на
+    // iOS 12 успевает протухнуть keep-alive соединение.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        __block NSData *data = nil;
+        __block NSHTTPURLResponse *http = nil;
+        __block NSError *error = nil;
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+            dataTaskWithRequest:HVPNStoreSubscriptionRequest(url)
+              completionHandler:^(NSData *body, NSURLResponse *rawResponse, NSError *taskError) {
+            data = body;
+            error = taskError;
+            if ([rawResponse isKindOfClass:[NSHTTPURLResponse class]]) {
+                http = (NSHTTPURLResponse *)rawResponse;
+            }
+            dispatch_semaphore_signal(semaphore);
+        }];
+        [task resume];
+        dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_SEC));
+
         responseData = data;
+        httpResponse = http;
         responseError = error;
-        if ([response isKindOfClass:[NSHTTPURLResponse class]]) httpResponse = (NSHTTPURLResponse *)response;
-        dispatch_semaphore_signal(semaphore);
-    }];
-    [task resume];
-    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_SEC));
+        if (error == nil && http.statusCode < 500) break;
+        if (attempt == 0) {
+            NSString *why = error.localizedDescription ?: [NSString stringWithFormat:@"HTTP %ld", (long)http.statusCode];
+            [self log:@"[..] повтор после: %@", why];
+            [NSThread sleepForTimeInterval:1.0];
+        }
+    }
 
     if (responseError != nil) {
-        [self log:@"[-] %@ — сеть: %@", url.host ?: @"?", responseError.localizedDescription];
+        // Таймаут — почти всегда не «медленно», а «адрес не пускают»: блокировка
+        // панели провайдером или мёртвый маршрут. Подсказываем, что делать.
+        NSString *hint = @"";
+        if (responseError.code == NSURLErrorTimedOut) {
+            hint = @". Адрес панели не отвечает — похоже, его блокирует провайдер: "
+                    "включите VPN на рабочей ноде и повторите.";
+        } else if (responseError.code == NSURLErrorCannotFindHost) {
+            hint = @". DNS не нашёл хост — проверьте сеть или DNS.";
+        }
+        [self log:@"[-] %@ — сеть: %@%@", url.host ?: @"?", responseError.localizedDescription, hint];
+        self.lastFetchError = [NSString stringWithFormat:@"%@ не открывается: %@%@",
+                               url.host ?: urlText, responseError.localizedDescription, hint];
         [self fetchURLs:urls index:index + 1 found:found placeholders:placeholders];
         return;
     }
+    self.lastFetchError = nil;
 
     NSString *userinfo = httpResponse.allHeaderFields[@"subscription-userinfo"];
     if ([userinfo isKindOfClass:[NSString class]] && userinfo.length) {
