@@ -40,6 +40,21 @@ static NSArray<NSString *> *HVPNUtunNames(void) {
     return utuns;
 }
 
+
+// Сброс кеша DNS: HUP заставляет mDNSResponder перечитать состояние.
+static void HVPNFlushDNSCache(void) {
+    pid_t pid = 0;
+    const char *path = "/usr/bin/killall";
+    char *const argv[] = {(char *const)"killall", (char *const)"-HUP", (char *const)"mDNSResponder", NULL};
+    if (posix_spawn(&pid, path, NULL, NULL, argv, NULL) != 0) {
+        NSLog(@"[velad] не удалось сбросить кеш DNS (posix_spawn killall)");
+        return;
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    NSLog(@"[velad] кеш DNS сброшен (mDNSResponder HUP, статус %d)", status);
+}
+
 static NSArray<NSString *> *HVPNResolveIPv4(NSString *host) {
     if (host.length == 0) return @[];
     if ([host rangeOfString:@":"].location != NSNotFound) return @[]; // IPv6-литерал
@@ -475,10 +490,9 @@ static NSString *HVPNPrimaryInterface(void) {
 
         // Пока туннель поднимался, mDNSResponder мог запомнить отрицательный ответ
         // (в том числе для youtube.com) и потом отдавать его приложениям. Просим
-        // перечитать конфигурацию — кеш сбрасывается.
-        if (system("killall -HUP mDNSResponder >/dev/null 2>&1") == 0) {
-            NSLog(@"[velad] кеш DNS сброшен (mDNSResponder HUP)");
-        }
+        // перечитать конфигурацию — кеш сбрасывается. system() на iOS недоступен,
+        // поэтому posix_spawn.
+        HVPNFlushDNSCache();
 
         // Проверяем, что к серверу нет петли через наш же tun.
         for (NSString *ip in serverAddresses) {
