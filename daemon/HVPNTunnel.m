@@ -306,6 +306,9 @@ static NSString *HVPNPrimaryInterface(void) {
         }
 
         NSUInteger installedRoutes = _ifaceRoutes.count;
+        NSLog(@"[velad] маршрутов поставлено %lu из 4, проверка 0/1 -> ifindex %u (tun %u)",
+              (unsigned long)installedRoutes,
+              HVPNRouteInterfaceIndex(AF_INET, @"0.0.0.0", 1), ifindex);
         if (installedRoutes < 2) {
             [self stopLocked];
             return [self failure:[NSString stringWithFormat:

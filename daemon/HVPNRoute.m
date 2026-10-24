@@ -131,6 +131,43 @@ static BOOL HVPNParseAddr(int family, NSString *text, uint8_t out[16]) {
     return inet_pton(family, text.UTF8String, out) == 1;
 }
 
+static BOOL HVPNRunRoute(NSArray<NSString *> *args) {
+    static NSArray<NSString *> *candidates;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        candidates = @[@"/sbin/route", @"/usr/sbin/route", @"/bin/route"];
+    });
+
+    for (NSString *binary in candidates) {
+        if (![[NSFileManager defaultManager] isExecutableFileAtPath:binary]) continue;
+
+        NSUInteger count = args.count + 2;   // argv[0] = имя программы
+        char **argv = calloc(count, sizeof(char *));
+        if (argv == NULL) return NO;
+        argv[0] = (char *)[binary UTF8String];
+        for (NSUInteger i = 0; i < args.count; i++) argv[i + 1] = (char *)[args[i] UTF8String];
+        argv[args.count + 1] = NULL;
+
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+        pid_t pid = 0;
+        int rc = posix_spawn(&pid, binary.fileSystemRepresentation, &actions, NULL,
+                             argv, *_NSGetEnviron());
+        posix_spawn_file_actions_destroy(&actions);
+        free(argv);
+        if (rc != 0) continue;
+
+        int status = 0;
+        if (waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 // Резервный путь: /sbin/route. На iOS он есть и умеет -interface,
 // а нам важно не зависеть от тонкостей PF_ROUTE, которые на iOS
 // дают ENETUNREACH при добавлении маршрута в свежесозданный utun.
@@ -140,35 +177,11 @@ static BOOL HVPNRouteViaCommand(BOOL add, int family, NSString *dst, int prefix,
     if (ifindex == 0 || if_indextoname(ifindex, name) == NULL) return NO;
 
     NSString *target = [NSString stringWithFormat:@"%@/%d", dst, prefix];
-    NSArray *args = @[
-        @"/sbin/route",
+    return HVPNRunRoute(@[
         add ? @"add" : @"delete",
         @"-net", target,
         @"-interface", [NSString stringWithUTF8String:name]
-    ];
-
-    NSUInteger count = args.count + 1;
-    char **argv = calloc(count, sizeof(char *));
-    if (argv == NULL) return NO;
-    for (NSUInteger i = 0; i < args.count; i++) {
-        argv[i] = (char *)[args[i] UTF8String];
-    }
-    argv[args.count] = NULL;
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-
-    pid_t pid = 0;
-    int rc = posix_spawn(&pid, "/sbin/route", &actions, NULL, argv, *_NSGetEnviron());
-    posix_spawn_file_actions_destroy(&actions);
-    free(argv);
-    if (rc != 0) return NO;
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) != pid) return NO;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    ]);
 }
 
 static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefix,
@@ -186,22 +199,11 @@ static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefi
         fallback = HVPNRouteViaCommand(add, family, dst, prefix, ifindex);
     } else {
         // host-маршрут через шлюз: route add -host <ip> <gw>
-        char *argv[] = {
-            (char *)"/sbin/route", (char *)(add ? "add" : "delete"), (char *)"-host",
-            (char *)[dst UTF8String], (char *)[gateway UTF8String], NULL
-        };
-        posix_spawn_file_actions_t actions;
-        posix_spawn_file_actions_init(&actions);
-        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-        pid_t pid = 0;
-        if (posix_spawn(&pid, "/sbin/route", &actions, NULL, argv, *_NSGetEnviron()) == 0) {
-            int status = 0;
-            if (waitpid(pid, &status, 0) == pid) {
-                fallback = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-            }
-        }
-        posix_spawn_file_actions_destroy(&actions);
+        fallback = HVPNRunRoute(@[
+            add ? @"add" : @"delete",
+            @"-host", dst,
+            gateway
+        ]);
     }
 
     if (fallback) {
