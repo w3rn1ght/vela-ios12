@@ -33,7 +33,13 @@ static NSString *HVPNEnc(NSString *value) {
 }
 
 static NSString *HVPNNodeName(NSString *fragment, NSString *host, NSInteger port) {
-    if (fragment.length) return fragment;
+    if (fragment.length) {
+        // Панели любят дописывать к имени параметры: "🇷🇺 Россия №50?serverDescription=...".
+        NSRange q = [fragment rangeOfString:@"?"];
+        NSString *name = (q.location == NSNotFound) ? fragment : [fragment substringToIndex:q.location];
+        name = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (name.length) return name;
+    }
     return [NSString stringWithFormat:@"%@:%ld", host, (long)port];
 }
 

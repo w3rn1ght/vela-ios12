@@ -196,7 +196,10 @@ int main(void) {
                                                            error:NULL];
         printf("%s\n", [[[NSString alloc] initWithData:pretty encoding:NSUTF8StringEncoding] UTF8String]);
         expect([config[@"outbounds"][1][@"bind_interface"] isEqualToString:@"en0"], @"direct bound to en0");
-        expect([config[@"inbounds"][0][@"inet4_address"] isEqualToString:@"172.19.0.1/30"], @"tun inet4");
+        expect([config[@"inbounds"][0][@"address"][0] isEqualToString:@"172.19.0.1/30"], @"tun address");
+        expect(config[@"outbounds"][2] == nil, @"нет dns-out (удалён в 1.13)");
+        expect([config[@"route"][@"rules"][0][@"action"] isEqualToString:@"sniff"], @"sniff через действие");
+        expect([config[@"route"][@"default_domain_resolver"] isEqualToString:@"local"], @"resolver по умолчанию");
         expect([config[@"route"][@"final"] isEqualToString:@"proxy"], @"route final");
 
         printf("\n%s (%d failures)\n", gFailures == 0 ? "ALL PASSED" : "FAILURES", gFailures);

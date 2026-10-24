@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
-# Сборка ядра sing-box под iOS 12 / arm64 и упаковка его в layout.
-# Запускать ТОЛЬКО на macOS (нужны Xcode Command Line Tools и Go 1.21+).
+# Сборка ядра sing-box-lx под iOS 12 / arm64 и упаковка его в layout.
+# Запускать ТОЛЬКО на macOS (нужны Xcode Command Line Tools и Go 1.25+).
+#
+# Почему форк: upstream sing-box не умеет XHTTP (транспорт, на который сейчас
+# переехало большинство панелей, включая Happ-подписки) и не отправляет в
+# REALITY гибридный ключ X25519MLKEM768, который требует свежий Xray.
+# sing-box-lx добавляет и то, и другое за build-тегами.
 set -euo pipefail
 
-SING_BOX_VERSION="${SING_BOX_VERSION:-v1.8.14}"
+CORE_REPO="${CORE_REPO:-https://github.com/Leadaxe/sing-box-lx.git}"
+SING_BOX_VERSION="${SING_BOX_VERSION:-v1.14.3-lx.23}"
 MIN_IOS="${MIN_IOS:-12.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
 SRC_DIR="$BUILD_DIR/sing-box"
 OUT_DIR="$ROOT/layout/usr/libexec/vela"
 OUT_BIN="$OUT_DIR/sing-box"
-TAGS="with_gvisor,with_quic,with_utls,with_wireguard,with_dhcp"
+# with_xhttp — XHTTP-транспорт; badlinkname/tfogo_checklinkname0 нужны
+# sing-tun и gvisor начиная с Go 1.23.
+TAGS="with_gvisor,with_quic,with_utls,with_wireguard,with_dhcp,with_xhttp,badlinkname,tfogo_checklinkname0"
 
 die() { echo "ошибка: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || die "сборка ядра требует macOS (Darwin). На Linux/Windows используйте CI-воркфлоу."
-command -v go >/dev/null 2>&1 || die "не найден go. Установите Go 1.21+: brew install go"
+command -v go >/dev/null 2>&1 || die "не найден go. Установите Go 1.25+: brew install go"
 command -v xcrun >/dev/null 2>&1 || die "не найден xcrun. Установите Xcode Command Line Tools."
 
 SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -25,16 +33,20 @@ CLANG_BIN="$(xcrun --sdk iphoneos -f clang)"
 mkdir -p "$BUILD_DIR" "$OUT_DIR"
 
 if [ ! -d "$SRC_DIR/.git" ]; then
-	echo ">> клонирую sing-box $SING_BOX_VERSION"
-	git clone --depth 1 --branch "$SING_BOX_VERSION" \
-		https://github.com/SagerNet/sing-box.git "$SRC_DIR"
+	echo ">> клонирую sing-box-lx $SING_BOX_VERSION"
+	git clone --branch "$SING_BOX_VERSION" "$CORE_REPO" "$SRC_DIR"
+	# Подмодули (utls, sing-tun, gvisor) тянем полностью: --depth 1 на подмодулях
+	# часто падает на закреплённых коммитах.
+	cd "$SRC_DIR"
+	git submodule update --init --recursive
 else
 	cd "$SRC_DIR"
 	CURRENT="$(git describe --tags --exact-match 2>/dev/null || true)"
 	if [ "$CURRENT" != "$SING_BOX_VERSION" ]; then
 		echo ">> переключаюсь на $SING_BOX_VERSION"
-		git fetch --depth 1 origin "refs/tags/$SING_BOX_VERSION:refs/tags/$SING_BOX_VERSION"
+		git fetch origin "refs/tags/$SING_BOX_VERSION:refs/tags/$SING_BOX_VERSION"
 		git checkout -f "$SING_BOX_VERSION"
+		git submodule update --init --recursive
 	fi
 fi
 

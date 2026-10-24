@@ -288,6 +288,19 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
         NSUInteger placeholders = 0;
 
         [self collectText:text depth:0 found:found urls:urls placeholders:&placeholders];
+        // happ://add/<url> — обычная обёртка над ссылкой подписки, криптографии нет.
+        NSMutableArray<NSString *> *wrapped = [NSMutableArray arrayWithArray:found];
+        [found removeAllObjects];
+        for (NSString *line in wrapped) {
+            if ([line.lowercaseString hasPrefix:@"happ://add/"]) {
+                NSString *url = [line substringFromIndex:@"happ://add/".length];
+                if (url.length) [urls addObject:url];
+                continue;
+            }
+            // happ://routing/... — профиль маршрутизации Happ, к нодам отношения не имеет.
+            if ([line.lowercaseString hasPrefix:@"happ://routing/"]) continue;
+            [found addObject:line];
+        }
         [self fetchURLs:urls index:0 found:found placeholders:&placeholders];
 
         NSUInteger added = 0;

@@ -1,10 +1,16 @@
 #import "HVPNConfig.h"
 
-NSString *const HVPNVersionString = @"0.2.13";
+NSString *const HVPNVersionString = @"0.2.14";
 
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *opts = options ?: @{};
-    NSString *dnsRemote = opts[@"dnsRemote"] ?: @"https://1.1.1.1/dns-query";
+    NSString *dnsRemote = opts[@"dnsRemote"] ?: @"1.1.1.1";
+    // В новом формате DNS это просто адрес сервера: если пришёл URL вида
+    // https://1.1.1.1/dns-query, оставляем только хост.
+    if ([dnsRemote rangeOfString:@"://"].location != NSNotFound) {
+        NSURLComponents *parts = [NSURLComponents componentsWithString:dnsRemote];
+        if (parts.host.length) dnsRemote = parts.host;
+    }
     NSString *dnsLocal = opts[@"dnsLocal"] ?: @"223.5.5.5";
     NSNumber *bypassLAN = opts[@"bypassLAN"] ?: @YES;
     NSNumber *mtu = opts[@"mtu"] ?: @1400;
@@ -41,11 +47,13 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     }
 
     NSMutableArray *rules = [NSMutableArray array];
-    // Всё, что похоже на DNS (в том числе запросы mDNSResponder на LAN-DNS),
-    // уходит в модуль DNS внутри ядра — так работает перехват без правки resolv.conf.
-    [rules addObject:@{@"protocol": @"dns", @"outbound": @"dns-out"}];
+    // sing-box 1.13 убрал outbound "dns" и поле inbound.sniff: теперь и то, и
+    // другое — действия маршрута. sniff определяет протокол по первым байтам,
+    // hijack-dns забирает запросы в DNS-модуль ядра (без правки resolv.conf).
+    [rules addObject:@{@"action": @"sniff"}];
+    [rules addObject:@{@"protocol": @"dns", @"action": @"hijack-dns"}];
     // Страховка на случай, если sniff не сработал: обычный DNS-порт.
-    [rules addObject:@{@"port": @53, @"outbound": @"dns-out"}];
+    [rules addObject:@{@"port": @53, @"action": @"hijack-dns"}];
     if (bypassLAN.boolValue) {
         [rules addObject:@{@"ip_is_private": @YES, @"outbound": @"direct"}];
     }
@@ -53,18 +61,20 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
         [rules addObject:@{@"domain": @[domain], @"outbound": @"direct"}];
     }
 
+    // DNS: с 1.12 сервер описывается типом и тегом, строка address:// больше
+    // не разбирается, а "disable_cache" переехал в experimental.cache_file.
+    // remote — TCP-DNS через прокси: работает всегда, в отличие от UDP, который
+    // часть серверов VLESS не пропускает.
     NSMutableDictionary *dns = [@{
         @"servers": @[
-            @{@"tag": @"remote", @"address": dnsRemote, @"detour": @"proxy"},
-            @{@"tag": @"local", @"address": dnsLocal, @"detour": @"direct"}
+            @{@"type": @"tcp", @"tag": @"remote", @"server": dnsRemote, @"detour": @"proxy"},
+            @{@"type": @"udp", @"tag": @"local", @"server": dnsLocal, @"detour": @"direct"}
         ],
         @"final": @"remote",
-        @"strategy": @"prefer_ipv4",
-        @"disable_cache": @NO
+        @"strategy": @"prefer_ipv4"
     } mutableCopy];
     NSArray *localDomains = (NSArray *)opts[@"localDomains"];
     if ([localDomains isKindOfClass:[NSArray class]] && localDomains.count) {
-        // legacy-DNS формат 1.8.x: действие правила — "server".
         dns[@"rules"] = @[ @{@"server": @"local", @"domain_suffix": localDomains} ];
     }
 
@@ -75,17 +85,13 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
         // Без явного имени sing-box при GOOS=ios подставляет "tun0" и падает
         // с "bad tun name: tun0".
         @"interface_name": opts[@"interfaceName"] ?: @"utun4",
-        // Поля именно для sing-box 1.8.x (в 1.10+ они заменены на "address").
-        @"inet4_address": @"172.19.0.1/30",
-        @"inet6_address": @"fdfe:dcba:9876::1/126",
+        // С 1.11 адреса задаются массивом address вместо inet4_address/inet6_address.
+        @"address": @[@"172.19.0.1/30", @"fdfe:dcba:9876::1/126"],
         @"mtu": mtu,
         // Маршруты ставим сами (см. HVPNRoute.m): так проще откатывать и отлаживать.
         @"auto_route": @NO,
         @"strict_route": @NO,
-        @"stack": @"gvisor",
-        @"sniff": @YES,
-        @"sniff_override_destination": @YES,
-        @"udp_timeout": @"5m"
+        @"stack": @"gvisor"
     };
 
     NSMutableDictionary *config = [@{
@@ -95,15 +101,17 @@ NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
         @"inbounds": @[inbound],
         @"outbounds": @[
             outbound,
-            direct,
-            @{@"type": @"dns", @"tag": @"dns-out"}
+            direct
         ],
         @"route": @{
             @"rules": rules,
             @"final": @"proxy",
             // Когда интерфейс известен, привязываем исходящие сами (см. выше),
             // а автоопределение выключаем: на iOS оно иногда выбирает наш же utun.
-            @"auto_detect_interface": (bindInterface.length > 0) ? @NO : @YES
+            @"auto_detect_interface": (bindInterface.length > 0) ? @NO : @YES,
+            // С 1.12 без этого нельзя: домены для direct/прокси-нод резолвятся
+            // локальным DNS, а не сисколлом.
+            @"default_domain_resolver": @"local"
         },
         @"experimental": @{@"cache_file": @{@"enabled": @NO}}
     } mutableCopy];

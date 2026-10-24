@@ -212,6 +212,16 @@ NSDictionary *HVPNTransportDict(NSDictionary<NSString *, NSString *> *q, NSStrin
         t[@"path"] = path.length ? path : @"/";
         return t;
     }
+    if ([net isEqualToString:@"xhttp"] || [net isEqualToString:@"splithttp"]) {
+        // XHTTP (бывший splithttp): так сейчас отдаёт ноды большинство панелей,
+        // включая Happ-подписки. Поддерживается ядром sing-box-lx (тег with_xhttp).
+        NSMutableDictionary *t = [@{@"type": @"xhttp"} mutableCopy];
+        t[@"path"] = path.length ? path : @"/";
+        NSString *mode = HVPNFirst(q, @[@"mode"]);
+        t[@"mode"] = mode.length ? mode : @"auto";
+        if (host.length) t[@"host"] = host;
+        return t;
+    }
     if ([net isEqualToString:@"httpupgrade"]) {
         NSMutableDictionary *t = [@{@"type": @"httpupgrade"} mutableCopy];
         t[@"path"] = path.length ? path : @"/";
