@@ -235,6 +235,7 @@ static NSString *HVPNPrimaryInterface(void) {
     NSDate *_startedAt;
     NSDictionary *_lastProbe;
     NSInteger _nodePort;
+    NSString *_outboundSummary;
     NSMutableArray<NSDictionary *> *_ifaceRoutes;   // {family, dst, prefix, ifindex}
     NSMutableArray<NSArray *> *_hostRoutes;         // [family, ip, gateway]
 }
@@ -354,14 +355,16 @@ static NSString *HVPNPrimaryInterface(void) {
             ? tlsOpt[@"utls"] : nil;
         NSDictionary *transportOpt = [ob[@"transport"] isKindOfClass:[NSDictionary class]]
             ? ob[@"transport"] : nil;
-        NSLog(@"[velad] outbound: %@ %@:%ld flow=%@ tls=%@ sni=%@ fp=%@ reality=%@ pbk=%lu sid=%lu transport=%@",
-              ob[@"type"] ?: @"?", proxy.server, (long)proxy.port, ob[@"flow"] ?: @"-",
-              [tlsOpt[@"enabled"] boolValue] ? @"on" : @"off",
-              tlsOpt[@"server_name"] ?: @"-", utlsOpt[@"fingerprint"] ?: @"-",
-              [realityOpt[@"enabled"] boolValue] ? @"on" : @"off",
-              (unsigned long)[realityOpt[@"public_key"] length],
-              (unsigned long)[realityOpt[@"short_id"] length],
-              transportOpt[@"type"] ?: @"tcp");
+        _outboundSummary = [NSString stringWithFormat:
+            @"%@ %@:%ld flow=%@ tls=%@ sni=%@ fp=%@ reality=%@ pbk=%lu sid=%lu transport=%@",
+            ob[@"type"] ?: @"?", proxy.server, (long)proxy.port, ob[@"flow"] ?: @"-",
+            [tlsOpt[@"enabled"] boolValue] ? @"on" : @"off",
+            tlsOpt[@"server_name"] ?: @"-", utlsOpt[@"fingerprint"] ?: @"-",
+            [realityOpt[@"enabled"] boolValue] ? @"on" : @"off",
+            (unsigned long)[realityOpt[@"public_key"] length],
+            (unsigned long)[realityOpt[@"short_id"] length],
+            transportOpt[@"type"] ?: @"tcp"];
+        NSLog(@"[velad] outbound: %@", _outboundSummary);
 
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:kBaseDir withIntermediateDirectories:YES
@@ -523,7 +526,8 @@ static NSString *HVPNPrimaryInterface(void) {
             @"port": @(_nodePort),
             @"uptime": @(uptime),
             @"routes": @(_ifaceRoutes.count),
-            @"probe": _lastProbe ?: @{}
+            @"probe": _lastProbe ?: @{},
+            @"outbound": _outboundSummary ?: @""
         };
     }
 }

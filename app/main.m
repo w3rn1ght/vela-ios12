@@ -442,7 +442,34 @@ static NSString *HVPNPingText(HVPNNode *node) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSDictionary *response = HVPNSend(@{@"cmd": @"log"}, NULL, 10);
         NSString *coreLog = [response[@"log"] isKindOfClass:[NSString class]] ? response[@"log"] : nil;
+        NSDictionary *status = [response[@"status"] isKindOfClass:[NSDictionary class]]
+            ? response[@"status"] : nil;
+        NSMutableString *state = [NSMutableString string];
+        if (status) {
+            [state appendFormat:@"демон: v%@\n", response[@"version"] ?: @"?"];
+            [state appendFormat:@"нода: %@ (%@)\n",
+                status[@"node"] ?: @"-", status[@"protocol"] ?: @"-"];
+            [state appendFormat:@"адрес: %@:%@\n", status[@"server"] ?: @"-",
+                status[@"port"] ?: @"-"];
+            [state appendFormat:@"интерфейс: %@, маршрутов %@\n",
+                status[@"utun"] ?: @"-", status[@"routes"] ?: @"0"];
+            NSDictionary *probe = [status[@"probe"] isKindOfClass:[NSDictionary class]]
+                ? status[@"probe"] : nil;
+            if (probe) {
+                [state appendFormat:@"проба: %@%@\n",
+                    [probe[@"ok"] boolValue] ? @"ok " : @"НЕТ ТРАФИКА ",
+                    [probe[@"ok"] boolValue] ? [NSString stringWithFormat:@"%@ мс", probe[@"ms"] ?: @"?"]
+                                            : (probe[@"error"] ?: @"")];
+            }
+            if ([status[@"outbound"] length]) {
+                [state appendFormat:@"outbound: %@\n", status[@"outbound"]];
+            }
+        } else {
+            [state appendString:@"демон не отвечает\n"];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
+            [text appendString:@"\n— состояние —\n"];
+            [text appendString:state];
             [text appendString:@"\n— ядро —\n"];
             [text appendString:coreLog.length ? coreLog : @"(лог пуст или демон не запущен)"];
             self->_textView.text = text;
