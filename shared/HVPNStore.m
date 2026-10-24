@@ -1,4 +1,5 @@
 #import "HVPNStore.h"
+#import "HVPNHapp.h"
 #import "HVPNPaths.h"
 #import "HVPNLinkUtil.h"
 
@@ -288,9 +289,11 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
         NSUInteger placeholders = 0;
 
         [self collectText:text depth:0 found:found urls:urls placeholders:&placeholders];
-        // happ://add/<url> — обычная обёртка над ссылкой подписки, криптографии нет.
+        // happ://add/<url> — обёртка без криптографии, happ://crypt*/... — RSA (+ChaCha20
+        // для crypt5). Расшифрованное всегда оказывается URL подписки, его и тянем.
         NSMutableArray<NSString *> *wrapped = [NSMutableArray arrayWithArray:found];
         [found removeAllObjects];
+        NSError *happError = nil;
         for (NSString *line in wrapped) {
             if ([line.lowercaseString hasPrefix:@"happ://add/"]) {
                 NSString *url = [line substringFromIndex:@"happ://add/".length];
@@ -299,6 +302,19 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
             }
             // happ://routing/... — профиль маршрутизации Happ, к нодам отношения не имеет.
             if ([line.lowercaseString hasPrefix:@"happ://routing/"]) continue;
+            if ([HVPNHapp looksEncrypted:line]) {
+                NSError *decryptError = nil;
+                NSString *url = [HVPNHapp decryptLink:line error:&decryptError];
+                if (url.length) {
+                    [self log:@"happ: ссылка расшифрована -> %@", url];
+                    [urls addObject:url];
+                } else {
+                    happError = decryptError;
+                    [self log:@"[!] happ: не удалось расшифровать ссылку: %@",
+                              decryptError.localizedDescription ?: @"причина неизвестна"];
+                }
+                continue;
+            }
             [found addObject:line];
         }
         [self fetchURLs:urls index:0 found:found placeholders:&placeholders];
@@ -368,6 +384,9 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
             if (placeholders > 0) {
                 message = @"Панель отдала только заглушки (0.0.0.0:1). Обычно это значит, что подписка "
                           @"не активирована, истекла или исчерпан лимит устройств.";
+            } else if (happError != nil) {
+                message = [NSString stringWithFormat:@"Ссылка Happ не расшифровалась: %@",
+                                                     happError.localizedDescription ?: @"причина неизвестна"];
             } else if (_nodes.count > 0) {
                 message = @"Новых нод нет — все уже в списке.";
             } else {

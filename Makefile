@@ -1,6 +1,6 @@
 export TARGET = iphone:clang:latest:12.0
 export ARCHS = arm64
-export PACKAGE_VERSION = 0.2.14
+export PACKAGE_VERSION = 0.2.15
 export FINALPACKAGE = 1
 
 include $(THEOS)/makefiles/common.mk
@@ -13,9 +13,12 @@ Vela_FILES = \
 	shared/HVPNStore.m \
 	shared/HVPNLinkParser.m \
 	shared/HVPNLinkUtil.m \
-	shared/HVPNConfig.m
+	shared/HVPNConfig.m \
+	shared/HVPNHapp.m \
+	shared/HVPNHappKeys.m \
+	shared/HVPNChaCha.c
 
-Vela_FRAMEWORKS = UIKit Foundation
+Vela_FRAMEWORKS = UIKit Foundation Security
 Vela_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
 	-I$(THEOS_PROJECT_DIR)/shared -I$(THEOS_PROJECT_DIR)/daemon
 Vela_CODESIGN_FLAGS = -Sentitlements/app.plist

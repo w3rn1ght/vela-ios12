@@ -1,6 +1,6 @@
 #import "HVPNConfig.h"
 
-NSString *const HVPNVersionString = @"0.2.14";
+NSString *const HVPNVersionString = @"0.2.15";
 
 NSDictionary *HVPNBuildConfig(HVPNProxy *proxy, NSDictionary *options) {
     NSDictionary *opts = options ?: @{};
