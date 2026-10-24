@@ -146,7 +146,7 @@ static SecKeyRef HVPNKeyForBase64(NSString *base64) {
 static NSData *HVPNRSADecrypt(SecKeyRef key, NSData *ciphertext) {
     if (key == NULL || ciphertext.length == 0) return nil;
     CFErrorRef cfError = NULL;
-    CFDataRef plain = SecKeyCreateDecryptedData(key, kSecPaddingPKCS1,
+    CFDataRef plain = SecKeyCreateDecryptedData(key, kSecKeyAlgorithmRSAEncryptionPKCS1,
                                                 (__bridge CFDataRef)ciphertext, &cfError);
     if (cfError) CFRelease(cfError);
     if (plain == NULL) return nil;
