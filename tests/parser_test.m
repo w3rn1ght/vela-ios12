@@ -137,13 +137,18 @@ int main(void) {
         expect(reality.outbound[@"transport"] == nil, @"no transport for tcp");
         expect(![HVPNLinkParser isPlaceholderLink:realityLink], @"real link is not a placeholder");
 
-        printf("xhttp -> понятная ошибка (ядро 1.8 его не умеет)\n");
+        printf("xhttp -> транспорт для ядра 1.14\n");
         NSError *xhttpError = nil;
         HVPNProxy *xhttp = [HVPNLinkParser proxyFromLink:
             @"vless://11111111-2222-3333-4444-555555555555@x.example.net:443"
-            @"?encryption=none&security=tls&sni=x.example.net&fp=chrome&type=xhttp&mode=auto#xhttp"
+            @"?encryption=none&security=tls&sni=x.example.net&fp=chrome&type=xhttp&mode=packet-up"
+            @"&path=%2Fstatic#xhttp"
             error:&xhttpError];
-        expect(xhttp == nil && [xhttpError.localizedDescription containsString:@"xhttp"], @"xhttp rejected");
+        expect(xhttp != nil, @"xhttp parsed");
+        expect([xhttp.outbound[@"transport"][@"type"] isEqualToString:@"xhttp"], @"xhttp transport type");
+        expect([xhttp.outbound[@"transport"][@"mode"] isEqualToString:@"packet-up"], @"xhttp mode");
+        expect([xhttp.outbound[@"transport"][@"path"] isEqualToString:@"/static"], @"xhttp path");
+        expect([xhttp.name isEqualToString:@"xhttp"], @"name without query");
 
         printf("заглушка панели\n");
         NSString *stubLink =
@@ -197,7 +202,7 @@ int main(void) {
         printf("%s\n", [[[NSString alloc] initWithData:pretty encoding:NSUTF8StringEncoding] UTF8String]);
         expect([config[@"outbounds"][1][@"bind_interface"] isEqualToString:@"en0"], @"direct bound to en0");
         expect([config[@"inbounds"][0][@"address"][0] isEqualToString:@"172.19.0.1/30"], @"tun address");
-        expect(config[@"outbounds"][2] == nil, @"нет dns-out (удалён в 1.13)");
+        expect([config[@"outbounds"] count] == 2, @"нет dns-out (удалён в 1.13)");
         expect([config[@"route"][@"rules"][0][@"action"] isEqualToString:@"sniff"], @"sniff через действие");
         expect([config[@"route"][@"default_domain_resolver"] isEqualToString:@"local"], @"resolver по умолчанию");
         expect([config[@"route"][@"final"] isEqualToString:@"proxy"], @"route final");
