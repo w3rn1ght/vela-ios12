@@ -3,13 +3,17 @@
 
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <crt_externs.h>
 
 #define HVPN_ROUNDUP(a) ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))
 
@@ -127,28 +131,110 @@ static BOOL HVPNParseAddr(int family, NSString *text, uint8_t out[16]) {
     return inet_pton(family, text.UTF8String, out) == 1;
 }
 
+// Резервный путь: /sbin/route. На iOS он есть и умеет -interface,
+// а нам важно не зависеть от тонкостей PF_ROUTE, которые на iOS
+// дают ENETUNREACH при добавлении маршрута в свежесозданный utun.
+static BOOL HVPNRouteViaCommand(BOOL add, int family, NSString *dst, int prefix, unsigned ifindex) {
+    char name[IFNAMSIZ];
+    memset(name, 0, sizeof(name));
+    if (ifindex == 0 || if_indextoname(ifindex, name) == NULL) return NO;
+
+    NSString *target = [NSString stringWithFormat:@"%@/%d", dst, prefix];
+    NSArray *args = @[
+        @"/sbin/route",
+        add ? @"add" : @"delete",
+        @"-net", target,
+        @"-interface", [NSString stringWithUTF8String:name]
+    ];
+
+    NSUInteger count = args.count + 1;
+    char **argv = calloc(count, sizeof(char *));
+    if (argv == NULL) return NO;
+    for (NSUInteger i = 0; i < args.count; i++) {
+        argv[i] = (char *)[args[i] UTF8String];
+    }
+    argv[args.count] = NULL;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, "/sbin/route", &actions, NULL, argv, *_NSGetEnviron());
+    posix_spawn_file_actions_destroy(&actions);
+    free(argv);
+    if (rc != 0) return NO;
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return NO;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefix,
+                                   unsigned ifindex, NSString *gateway) {
+    int result = HVPNRouteOp(cmd, family, dst, prefix, ifindex, gateway);
+    if (result == 0) return 0;
+
+    int saved = errno;
+    BOOL add = (cmd == HVPN_RTM_ADD);
+    BOOL fallback = NO;
+    if (gateway.length == 0) {
+        fallback = HVPNRouteViaCommand(add, family, dst, prefix, ifindex);
+    } else {
+        // host-маршрут через шлюз: route add -host <ip> <gw>
+        char *argv[] = {
+            (char *)"/sbin/route", (char *)(add ? "add" : "delete"), (char *)"-host",
+            (char *)[dst UTF8String], (char *)[gateway UTF8String], NULL
+        };
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        pid_t pid = 0;
+        if (posix_spawn(&pid, "/sbin/route", &actions, NULL, argv, *_NSGetEnviron()) == 0) {
+            int status = 0;
+            if (waitpid(pid, &status, 0) == pid) {
+                fallback = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            }
+        }
+        posix_spawn_file_actions_destroy(&actions);
+    }
+
+    if (fallback) {
+        NSLog(@"[velad] маршрут %@/%d через ifindex %u поставлен через /sbin/route "
+              @"(PF_ROUTE дал: %s)", dst, prefix, ifindex, strerror(saved));
+        errno = 0;
+        return 0;
+    }
+    errno = saved;
+    return -1;
+}
+
 int HVPNRouteAddInterface(int family, NSString *dst, int prefix, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(HVPN_RTM_ADD, family, addr, prefix, ifindex, nil);
+    return HVPNRouteOpWithFallback(HVPN_RTM_ADD, family, dst, prefix, ifindex, nil);
 }
 
 int HVPNRouteDeleteInterface(int family, NSString *dst, int prefix, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(HVPN_RTM_DELETE, family, addr, prefix, ifindex, nil);
+    return HVPNRouteOpWithFallback(HVPN_RTM_DELETE, family, dst, prefix, ifindex, nil);
 }
 
 int HVPNRouteAddHost(int family, NSString *dst, NSString *gateway, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(HVPN_RTM_ADD, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
+    return HVPNRouteOpWithFallback(HVPN_RTM_ADD, family, dst, family == AF_INET ? 32 : 128,
+                                   ifindex, gateway);
 }
 
 int HVPNRouteDeleteHost(int family, NSString *dst, NSString *gateway, unsigned ifindex) {
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
-    return HVPNRouteOp(HVPN_RTM_DELETE, family, addr, family == AF_INET ? 32 : 128, ifindex, gateway);
+    return HVPNRouteOpWithFallback(HVPN_RTM_DELETE, family, dst, family == AF_INET ? 32 : 128,
+                                   ifindex, gateway);
 }
 
 BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {

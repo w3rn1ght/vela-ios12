@@ -97,7 +97,7 @@ static NSDictionary *HVPNSendQuick(NSDictionary *request) {
 
 static NSString *HVPNPingText(HVPNNode *node) {
     if (!node.supported) return @"не поддерживается";
-    if (node.pingMs >= 0) return [NSString stringWithFormat:@"%ld мс", (long)node.pingMs];
+    if (node.pingMs > 0) return [NSString stringWithFormat:@"%ld мс", (long)node.pingMs];
     if (node.pingError.length) return node.pingError;
     return @"—";
 }
@@ -658,6 +658,10 @@ static NSString *HVPNPingText(HVPNNode *node) {
     _pingRemaining = nodes.count;
     [self.tableView reloadData];
 
+    __block NSDictionary *sampleResponse = nil;
+    __block NSString *sampleName = nil;
+    __block NSUInteger okCount = 0;
+
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(6);
     for (NSUInteger index = 0; index < nodes.count; index++) {
         HVPNNode *node = nodes[index];
@@ -670,9 +674,17 @@ static NSString *HVPNPingText(HVPNNode *node) {
                                       @"port": @(node.port)}, NULL, 15);
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                node.pingMs = [response[@"ok"] boolValue] ? [response[@"ms"] integerValue] : -1;
-                node.pingError = [response[@"ok"] boolValue]
+                BOOL ok = [response[@"ok"] boolValue];
+                node.pingMs = ok ? [response[@"ms"] integerValue] : -1;
+                node.pingError = ok
                     ? nil : (response[@"error"] ?: (response ? @"нет ответа" : @"демон не отвечает"));
+                if (ok) {
+                    okCount++;
+                    if (sampleResponse == nil) {
+                        sampleResponse = response;
+                        sampleName = node.name;
+                    }
+                }
                 NSIndexPath *path = [NSIndexPath indexPathForRow:(NSInteger)index inSection:0];
                 [self.tableView reloadRowsAtIndexPaths:@[path]
                                      withRowAnimation:UITableViewRowAnimationNone];
@@ -680,6 +692,12 @@ static NSString *HVPNPingText(HVPNNode *node) {
                 if (--self->_pingRemaining == 0) {
                     self->_pinging = NO;
                     [[HVPNStore shared] save];
+                    NSString *summary = [NSString stringWithFormat:
+                        @"[ping] нод %lu, ответили %lu, пример: %@ -> %@",
+                        (unsigned long)nodes.count, (unsigned long)okCount,
+                        sampleName ?: @"-",
+                        sampleResponse ? [sampleResponse description] : @"нет успешных"];
+                    [[HVPNStore shared] notePingSummary:summary];
                     [self.refreshControl endRefreshing];
                     [self updateUI];
                 }
@@ -703,18 +721,29 @@ static NSString *HVPNPingText(HVPNNode *node) {
                 NSDictionary *status = [response[@"status"] isKindOfClass:[NSDictionary class]]
                     ? response[@"status"] : @{};
                 self->_lastStatus = status;
+                NSString *daemonVersion = response[@"version"] ?: @"?";
+                BOOL versionMismatch = ![daemonVersion isEqualToString:HVPNVersionString];
+                NSString *warn = versionMismatch
+                    ? [NSString stringWithFormat:@"⚠ демон v%@ ≠ приложение v%@ — переустановите пакет\n",
+                       daemonVersion, HVPNVersionString]
+                    : @"";
                 if ([status[@"running"] boolValue]) {
                     self->_statusLabel.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.15 alpha:1.0];
-                    self->_statusLabel.text = [NSString stringWithFormat:@"● %@ · %@ · %@",
+                    self->_statusLabel.text = [NSString stringWithFormat:@"%@● %@ · %@ · %@",
+                                               warn,
                                                status[@"node"] ?: @"?",
                                                status[@"protocol"] ?: @"",
                                                status[@"utun"] ?: @""];
                 } else {
-                    self->_statusLabel.textColor = [UIColor darkGrayColor];
+                    self->_statusLabel.textColor = versionMismatch
+                        ? [UIColor colorWithRed:0.7 green:0.1 blue:0.1 alpha:1.0]
+                        : [UIColor darkGrayColor];
                     NSString *info = [HVPNStore shared].subscriptionInfo;
-                    self->_statusLabel.text = info.length
-                        ? [NSString stringWithFormat:@"○ отключено · трафик %@", info]
-                        : [NSString stringWithFormat:@"○ отключено (v%@)", response[@"version"] ?: @"?"];
+                    self->_statusLabel.text = [NSString stringWithFormat:@"%@%@",
+                        warn,
+                        info.length
+                            ? [NSString stringWithFormat:@"○ отключено · трафик %@", info]
+                            : [NSString stringWithFormat:@"○ отключено (v%@)", daemonVersion]];
                 }
             }
             [self updateUI];

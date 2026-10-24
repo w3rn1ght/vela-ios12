@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netdb.h>
+#include <ifaddrs.h>
 #include <crt_externs.h>
 
 static NSString *const kBaseDir = HVPNStateDir;
@@ -70,6 +71,22 @@ static BOOL HVPNIsIPv4Literal(NSString *text) {
 
 // Следующее свободное имя utun: sing-tun на Darwin берёт номер из имени
 // ("utun4" -> юнит 5) и падает, если номер уже занят.
+// Интерфейс готов, когда он поднят и sing-box уже назначил ему IPv4-адрес.
+// Иначе добавление маршрута падает с ENETUNREACH ("Network is unreachable").
+static BOOL HVPNInterfaceReady(NSString *name) {
+    if (name.length == 0) return NO;
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0) return NO;
+    BOOL hasIPv4 = NO, isUp = NO;
+    for (struct ifaddrs *p = list; p != NULL; p = p->ifa_next) {
+        if (p->ifa_name == NULL || strcmp(p->ifa_name, name.UTF8String) != 0) continue;
+        if ((p->ifa_flags & IFF_UP) != 0) isUp = YES;
+        if (p->ifa_addr != NULL && p->ifa_addr->sa_family == AF_INET) hasIPv4 = YES;
+    }
+    freeifaddrs(list);
+    return isUp && hasIPv4;
+}
+
 static NSString *HVPNNextTunName(void) {
     NSInteger maxIndex = -1;
     for (NSString *name in HVPNUtunNames()) {
@@ -288,10 +305,13 @@ static NSString *HVPNPrimaryInterface(void) {
             NSLog(@"[happvpnd] IPv6-сервер: v6-маршруты в tun не ставлю");
         }
 
-        if (_ifaceRoutes.count < 2) {
-            NSString *err = HVPNErrnoString();
+        NSUInteger installedRoutes = _ifaceRoutes.count;
+        if (installedRoutes < 2) {
             [self stopLocked];
-            return [self failure:[NSString stringWithFormat:@"Не удалось поставить маршруты: %@", err]];
+            return [self failure:[NSString stringWithFormat:
+                @"Не удалось поставить маршруты (получилось %lu из 4). Подробности: "
+                @"/var/mobile/Library/Logs/Vela/daemon.log",
+                (unsigned long)installedRoutes]];
         }
 
         return @{@"ok": @YES, @"status": [self status]};
@@ -389,20 +409,31 @@ static NSString *HVPNPrimaryInterface(void) {
 - (NSString *)waitForTunNamed:(NSString *)name pid:(pid_t)pid timeout:(NSTimeInterval)timeout {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while ([deadline timeIntervalSinceNow] > 0) {
-        if (if_nametoindex(name.UTF8String) != 0) return name;
+        if (HVPNInterfaceReady(name)) return name;
         if (kill(pid, 0) != 0) return nil;   // ядро упало
         usleep(100 * 1000);
+    }
+    // Интерфейс мог появиться, но без адреса — для диагностики это лучше, чем nil.
+    if (if_nametoindex(name.UTF8String) != 0) {
+        NSLog(@"[velad] %@ существует, но без IPv4-адреса", name);
+        return name;
     }
     return nil;
 }
 
-- (void)addInterfaceRoute:(int)family dst:(NSString *)dst prefix:(int)prefix ifindex:(unsigned)ifindex {
-    if (HVPNRouteAddInterface(family, dst, prefix, ifindex) == 0) {
-        [_ifaceRoutes addObject:@{@"family": @(family), @"dst": dst,
-                                  @"prefix": @(prefix), @"ifindex": @(ifindex)}];
-    } else {
-        NSLog(@"[happvpnd] route add %@/%d failed: %@", dst, prefix, HVPNErrnoString());
+- (BOOL)addInterfaceRoute:(int)family dst:(NSString *)dst prefix:(int)prefix ifindex:(unsigned)ifindex {
+    // 5 попыток: на iOS маршрут в только что созданный utun нередко отбивается
+    // ENETUNREACH, пока ядро не досоздало адрес/состояние интерфейса.
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (HVPNRouteAddInterface(family, dst, prefix, ifindex) == 0) {
+            [_ifaceRoutes addObject:@{@"family": @(family), @"dst": dst,
+                                      @"prefix": @(prefix), @"ifindex": @(ifindex)}];
+            return YES;
+        }
+        NSLog(@"[velad] маршрут %@/%d, попытка %d: %@", dst, prefix, attempt + 1, HVPNErrnoString());
+        usleep(150 * 1000);
     }
+    return NO;
 }
 
 - (void)addHostRoutesForServerAddresses:(NSArray<NSString *> *)addresses {

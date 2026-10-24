@@ -45,8 +45,10 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)setHWID:(NSString *)hwid;
 + (void)resetHWID;
 
-/// Файл с отчётом последней загрузки подписки (для `cat` по SSH).
+/// Отчёт последней загрузки подписки/пинга (для `cat` по SSH).
 @property (nonatomic, readonly) NSString *diagnosticsPath;
+
+- (void)notePingSummary:(NSString *)line;
 
 @end
 

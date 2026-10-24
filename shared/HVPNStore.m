@@ -158,6 +158,12 @@
     }
 }
 
+- (void)notePingSummary:(NSString *)line {
+    if (line.length == 0) return;
+    [self log:@"%@", line];
+    [self writeReport];
+}
+
 - (NSString *)diagnosticsPath {
     return [HVPNStateDir stringByAppendingPathComponent:@"last-subscription.txt"];
 }
