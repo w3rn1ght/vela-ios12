@@ -296,6 +296,20 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
             BOOL duplicate = NO;
             for (HVPNNode *existing in _nodes) {
                 if ([existing.link isEqualToString:node.link]) { duplicate = YES; break; }
+                // Панель перевыпустила ключи REALITY: имя и адрес те же, ссылка
+                // другая. Без этого в списке осталась бы старая нода с мёртвыми
+                // ключами, и «обновить подписку» не помогло бы.
+                if ([existing.name isEqualToString:node.name] &&
+                    [existing.server isEqualToString:node.server] &&
+                    existing.port == node.port) {
+                    existing.link = node.link;
+                    existing.type = node.type;
+                    existing.supported = node.supported;
+                    existing.pingMs = -1;
+                    existing.pingError = nil;
+                    duplicate = YES;
+                    break;
+                }
             }
             if (duplicate) continue;
             [_nodes addObject:node];

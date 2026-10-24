@@ -38,6 +38,20 @@ jobs:
       - name: Build .deb
         run: make package
 
+      - name: Build .ipa
+        run: |
+          set -euo pipefail
+          APP=".theos/_/Applications/Vela.app"
+          test -d "$APP"
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/Vela.app
+          VERSION=$(sed -n 's/^export PACKAGE_VERSION = //p' Makefile)
+          cd build/ipa
+          zip -qry "../Vela-${VERSION}.ipa" Payload
+          cd ../..
+          ls -lh build/*.ipa
+
       - name: Inspect binaries
         run: |
           echo "--- core ---"
@@ -67,4 +81,10 @@ jobs:
         with:
           name: vela-deb
           path: packages/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vela-ipa
+          path: build/*.ipa
           if-no-files-found: error

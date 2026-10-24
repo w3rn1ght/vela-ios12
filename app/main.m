@@ -696,22 +696,34 @@ static NSString *HVPNPingText(HVPNNode *node) {
 - (void)autoPick {
     if (_busy) return;
     NSArray<HVPNNode *> *all = [HVPNStore shared].nodes;
-    NSMutableArray<NSNumber *> *candidates = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *plain = [NSMutableArray array];   // без REALITY
+    NSMutableArray<NSNumber *> *reality = [NSMutableArray array];
     for (NSUInteger i = 0; i < all.count; i++) {
         HVPNNode *node = all[i];
-        if (node.supported && node.pingMs > 0) [candidates addObject:@(i)];
+        if (!node.supported) continue;
+        BOOL isReality = [node.link rangeOfString:@"security=reality"].location != NSNotFound;
+        // У нод без REALITY пинг часто не проходит, но работать они могут,
+        // поэтому берём их все; остальные — по возрастанию пинга.
+        if (isReality) {
+            if (node.pingMs > 0) [reality addObject:@(i)];
+        } else {
+            [plain addObject:@(i)];
+        }
     }
-    if (candidates.count == 0) {
-        [self alert:@"Сначала потяните список вниз — нужен пинг нод."];
-        return;
-    }
-    [candidates sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+    [reality sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
         HVPNNode *na = all[a.unsignedIntegerValue];
         HVPNNode *nb = all[b.unsignedIntegerValue];
         return [@(na.pingMs) compare:@(nb.pingMs)];
     }];
+    NSMutableArray<NSNumber *> *candidates = [NSMutableArray array];
+    [candidates addObjectsFromArray:plain];
+    [candidates addObjectsFromArray:reality];
+    if (candidates.count == 0) {
+        [self alert:@"Список пуст."];
+        return;
+    }
 
-    NSUInteger limit = MIN(candidates.count, 10);
+    NSUInteger limit = MIN(candidates.count, 16);
     _busy = YES;
     [self updateUI];
 
@@ -938,8 +950,14 @@ static NSString *HVPNPingText(HVPNNode *node) {
     cell.textLabel.text = node.name;
     cell.textLabel.textColor = node.supported ? [UIColor blackColor] : [UIColor lightGrayColor];
 
-    NSString *detail = [NSString stringWithFormat:@"%@ · %@:%ld · %@",
-                        node.type, node.server, (long)node.port, HVPNPingText(node)];
+    NSString *security = [node.link rangeOfString:@"security=reality"].location != NSNotFound
+        ? @"reality"
+        : ([node.link rangeOfString:@"security=tls"].location != NSNotFound ? @"tls" : @"");
+    NSString *detail = security.length
+        ? [NSString stringWithFormat:@"%@·%@ · %@:%ld · %@",
+           node.type, security, node.server, (long)node.port, HVPNPingText(node)]
+        : [NSString stringWithFormat:@"%@ · %@:%ld · %@",
+           node.type, node.server, (long)node.port, HVPNPingText(node)];
     cell.detailTextLabel.text = detail;
     UIColor *detailColor = [UIColor grayColor];
     if (!node.supported) {
