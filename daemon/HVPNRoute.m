@@ -37,22 +37,25 @@ static int HVPNRouteOpEx(int cmd, int family, const void *dst, int prefix,
     rtm->rtm_version = HVPN_RTM_VERSION;
     rtm->rtm_type = (u_char)cmd;
     rtm->rtm_flags = HVPN_RTF_UP | HVPN_RTF_STATIC;
-    rtm->rtm_addrs = HVPN_RTA_DST | HVPN_RTA_NETMASK;
-    if (withGateway) rtm->rtm_addrs |= HVPN_RTA_GATEWAY;
 
+    BOOL gatewayIsIP = withGateway && gateway.length > 0;
+    if (gatewayIsIP) {
+        rtm->rtm_flags |= HVPN_RTF_GATEWAY;
+        if (prefix == (family == AF_INET ? 32 : 128)) rtm->rtm_flags |= HVPN_RTF_HOST;
+    }
+
+    // ВАЖНО: порядок sockaddr в сообщении должен совпадать с порядком битов в
+    // rtm_addrs, то есть RTA_DST (1) -> RTA_GATEWAY (2) -> RTA_NETMASK (4).
+    // Ядро разбирает атрибуты в порядке битов, а не в порядке записи: если
+    // положить netmask вторым, он прочитает его как gateway, а sockaddr_dl —
+    // как netmask. Тогда 0.0.0.0/1 превращается в default и add отвечает
+    // EEXIST, а ::/1 — ENETUNREACH. Именно это и было в логах.
+    rtm->rtm_addrs = HVPN_RTA_DST;
     if (family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)cp;
         sin->sin_len = sizeof(struct sockaddr_in);
         sin->sin_family = AF_INET;
         memcpy(&sin->sin_addr, dst, 4);
-        cp += sizeof(struct sockaddr_in);
-        len += (int)sizeof(struct sockaddr_in);
-
-        sin = (struct sockaddr_in *)cp;
-        sin->sin_len = sizeof(struct sockaddr_in);
-        sin->sin_family = AF_INET;
-        in_addr_t mask = (prefix <= 0) ? 0 : htonl(0xFFFFFFFFu << (32 - prefix));
-        sin->sin_addr.s_addr = mask;
         cp += sizeof(struct sockaddr_in);
         len += (int)sizeof(struct sockaddr_in);
     } else {
@@ -62,55 +65,67 @@ static int HVPNRouteOpEx(int cmd, int family, const void *dst, int prefix,
         memcpy(&s6->sin6_addr, dst, 16);
         cp += sizeof(struct sockaddr_in6);
         len += (int)sizeof(struct sockaddr_in6);
+    }
 
+    if (withGateway) {
+        rtm->rtm_addrs |= HVPN_RTA_GATEWAY;
+        if (gatewayIsIP) {
+            if (family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)cp;
+                sin->sin_len = sizeof(struct sockaddr_in);
+                sin->sin_family = AF_INET;
+                if (inet_pton(AF_INET, gateway.UTF8String, &sin->sin_addr) != 1) {
+                    close(fd);
+                    errno = EINVAL;
+                    return -1;
+                }
+                cp += sizeof(struct sockaddr_in);
+                len += (int)sizeof(struct sockaddr_in);
+            } else {
+                struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)cp;
+                s6->sin6_len = sizeof(struct sockaddr_in6);
+                s6->sin6_family = AF_INET6;
+                if (inet_pton(AF_INET6, gateway.UTF8String, &s6->sin6_addr) != 1) {
+                    close(fd);
+                    errno = EINVAL;
+                    return -1;
+                }
+                cp += sizeof(struct sockaddr_in6);
+                len += (int)sizeof(struct sockaddr_in6);
+            }
+        } else {
+            struct hvpn_sockaddr_dl *sdl = (struct hvpn_sockaddr_dl *)cp;
+            memset(sdl, 0, sizeof(*sdl));
+            sdl->sdl_len = sizeof(struct hvpn_sockaddr_dl);
+            sdl->sdl_family = AF_LINK;
+            sdl->sdl_index = (u_short)ifindex;
+            cp += sizeof(struct hvpn_sockaddr_dl);
+            len += (int)sizeof(struct hvpn_sockaddr_dl);
+        }
+    }
+
+    rtm->rtm_addrs |= HVPN_RTA_NETMASK;
+    if (family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)cp;
+        sin->sin_len = sizeof(struct sockaddr_in);
+        sin->sin_family = AF_INET;
+        in_addr_t mask = (prefix <= 0) ? 0 : htonl(0xFFFFFFFFu << (32 - prefix));
+        sin->sin_addr.s_addr = mask;
+        cp += sizeof(struct sockaddr_in);
+        len += (int)sizeof(struct sockaddr_in);
+    } else {
         uint8_t mask[16];
         memset(mask, 0, sizeof(mask));
         int full = prefix / 8;
         for (int i = 0; i < full && i < 16; i++) mask[i] = 0xFF;
         if (prefix % 8 && full < 16) mask[full] = (uint8_t)(0xFF << (8 - prefix % 8));
 
-        s6 = (struct sockaddr_in6 *)cp;
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)cp;
         s6->sin6_len = sizeof(struct sockaddr_in6);
         s6->sin6_family = AF_INET6;
         memcpy(&s6->sin6_addr, mask, 16);
         cp += sizeof(struct sockaddr_in6);
         len += (int)sizeof(struct sockaddr_in6);
-    }
-
-    if (!withGateway) {
-        // Удаление идёт без RTA_GATEWAY: ядро ищет запись по dst+mask.
-    } else if (gateway.length) {
-        if (family == AF_INET) {
-            struct sockaddr_in *sin = (struct sockaddr_in *)cp;
-            sin->sin_len = sizeof(struct sockaddr_in);
-            sin->sin_family = AF_INET;
-            if (inet_pton(AF_INET, gateway.UTF8String, &sin->sin_addr) != 1) {
-                close(fd);
-                errno = EINVAL;
-                return -1;
-            }
-            cp += sizeof(struct sockaddr_in);
-            len += (int)sizeof(struct sockaddr_in);
-        } else {
-            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)cp;
-            s6->sin6_len = sizeof(struct sockaddr_in6);
-            s6->sin6_family = AF_INET6;
-            if (inet_pton(AF_INET6, gateway.UTF8String, &s6->sin6_addr) != 1) {
-                close(fd);
-                errno = EINVAL;
-                return -1;
-            }
-            cp += sizeof(struct sockaddr_in6);
-            len += (int)sizeof(struct sockaddr_in6);
-        }
-    } else {
-        struct hvpn_sockaddr_dl *sdl = (struct hvpn_sockaddr_dl *)cp;
-        memset(sdl, 0, sizeof(*sdl));
-        sdl->sdl_len = sizeof(struct hvpn_sockaddr_dl);
-        sdl->sdl_family = AF_LINK;
-        sdl->sdl_index = (u_short)ifindex;
-        cp += sizeof(struct hvpn_sockaddr_dl);
-        len += (int)sizeof(struct hvpn_sockaddr_dl);
     }
 
     rtm->rtm_msglen = (u_short)len;
@@ -249,10 +264,16 @@ static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefi
             return 0;
         }
         if (result != 0 && errno == EEXIST) {
+            unsigned existing = HVPNRouteInterfaceIndex(family, dst, prefix);
+            if (existing == ifindex) {
+                NSLog(@"[velad] %@ уже указывает на наш tun (ifindex %u) — ок",
+                      target, ifindex);
+                return 0;
+            }
             // Маршрут уже есть: скорее всего остался от прошлой сессии.
             // Снимаем его (по сети, без привязки к интерфейсу) и ставим заново.
             NSLog(@"[velad] %@ уже есть (ifindex %u), снимаю и ставлю заново",
-                  target, HVPNRouteInterfaceIndex(family, dst, prefix));
+                  target, existing);
             HVPNRouteDeleteOp(family, addr, prefix, 0);
             HVPNRouteDeleteOp(family, addr, prefix, ifindex);
             HVPNRunRoute(@[@"delete", @"-net", target]);

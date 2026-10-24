@@ -20,6 +20,7 @@
 
 #define HVPN_RTF_UP      0x1
 #define HVPN_RTF_GATEWAY 0x2
+#define HVPN_RTF_HOST    0x4
 #define HVPN_RTF_STATIC  0x800
 
 #define HVPN_RTA_DST     0x1
