@@ -489,12 +489,6 @@ static NSString *HVPNPingText(HVPNNode *node) {
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
-@end
-
-#pragma mark - Список нод
-
-@interface HVPNNodesViewController : UITableViewController
-
 - (void)appendLogText:(NSString *)text {
     _textView.text = [_textView.text stringByAppendingString:text];
     NSRange end = NSMakeRange(_textView.text.length, 0);
@@ -593,6 +587,13 @@ static NSString *HVPNPingText(HVPNNode *node) {
         });
     });
 }
+
+@end
+
+#pragma mark - Список нод
+
+@interface HVPNNodesViewController : UITableViewController
+
 
 @end
 
