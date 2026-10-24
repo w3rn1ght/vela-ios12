@@ -137,12 +137,12 @@ static NSString *HVPNSystemDNS(void) {
 // Сквозная проверка туннеля. connect() сам по себе ничего не доказывает: gvisor
 // принимает TCP-хендшейк сразу, даже если прокси мёртв. Поэтому отправляем
 // HTTP-запрос и ждём ответ: живой туннель отдаст "HTTP/...", мёртвый — EOF.
-static NSDictionary *HVPNRunProbe(NSTimeInterval timeout) {
+static NSDictionary *HVPNProbeHostPort(const char *host, uint16_t port, NSTimeInterval timeout) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    inet_pton(AF_INET, "1.1.1.1", &addr.sin_addr);
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, host, &addr.sin_addr);
 
     NSDate *started = [NSDate date];
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -179,8 +179,10 @@ static NSDictionary *HVPNRunProbe(NSTimeInterval timeout) {
         }
     }
 
-    const char *request = "GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
-    if (write(fd, request, strlen(request)) <= 0) {
+    char request[128];
+    int requestLen = snprintf(request, sizeof(request),
+                              "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", host);
+    if (write(fd, request, (size_t)requestLen) <= 0) {
         NSString *error = HVPNErrnoString();
         close(fd);
         return @{@"ok": @NO, @"error": error};
@@ -198,9 +200,20 @@ static NSDictionary *HVPNRunProbe(NSTimeInterval timeout) {
     if (got > 0) return @{@"ok": @YES, @"ms": @(ms)};
     if (got == 0) {
         return @{@"ok": @NO, @"ms": @(ms),
-                 @"error": @"ядро закрыло соединение — прокси не отвечает"};
+                 @"error": [NSString stringWithFormat:
+                            @"ядро закрыло соединение (%s) — прокси не пропускает", host]};
     }
-    return @{@"ok": @NO, @"ms": @(ms), @"error": @"нет ответа через туннель"};
+    return @{@"ok": @NO, @"ms": @(ms),
+             @"error": [NSString stringWithFormat:@"нет ответа от %s через туннель", host]};
+}
+
+// Проверяем два независимых адреса: провайдер может резать один из них.
+static NSDictionary *HVPNRunProbe(NSTimeInterval timeout) {
+    NSDictionary *first = HVPNProbeHostPort("1.1.1.1", 80, timeout);
+    if ([first[@"ok"] boolValue]) return first;
+    NSDictionary *second = HVPNProbeHostPort("8.8.8.8", 80, timeout);
+    if ([second[@"ok"] boolValue]) return second;
+    return first;
 }
 
 static NSString *HVPNPrimaryInterface(void) {
@@ -221,6 +234,7 @@ static NSString *HVPNPrimaryInterface(void) {
     NSString *_nodeType;
     NSDate *_startedAt;
     NSDictionary *_lastProbe;
+    NSInteger _nodePort;
     NSMutableArray<NSDictionary *> *_ifaceRoutes;   // {family, dst, prefix, ifindex}
     NSMutableArray<NSArray *> *_hostRoutes;         // [family, ip, gateway]
 }
@@ -397,6 +411,7 @@ static NSString *HVPNPrimaryInterface(void) {
         _nodeName = proxy.name;
         _nodeServer = proxy.server;
         _nodeType = proxy.type;
+        _nodePort = proxy.port;
         _startedAt = [NSDate date];
 
         // 0. Снять всё, что осталось от прошлых сессий (иначе add даёт EEXIST).
@@ -486,6 +501,7 @@ static NSString *HVPNPrimaryInterface(void) {
             @"node": _nodeName ?: @"",
             @"server": _nodeServer ?: @"",
             @"protocol": _nodeType ?: @"",
+            @"port": @(_nodePort),
             @"uptime": @(uptime),
             @"routes": @(_ifaceRoutes.count),
             @"probe": _lastProbe ?: @{}

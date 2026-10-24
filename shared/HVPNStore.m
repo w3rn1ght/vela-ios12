@@ -301,7 +301,25 @@ static NSString *HVPNStoreFormatUserinfo(NSString *raw) {
             [_nodes addObject:node];
             added++;
         }
-        if (_selectedIndex < 0 && _nodes.count) _selectedIndex = 0;
+        if (_selectedIndex < 0 && _nodes.count) {
+            // Панель отдаёт «Универсальный N» как shadowsocks на max.ru:1234 —
+            // это заглушки, через них трафик не идёт. По умолчанию берём
+            // первую поддерживаемую ноду другого типа.
+            NSInteger pick = -1;
+            for (NSUInteger i = 0; i < _nodes.count; i++) {
+                HVPNNode *node = _nodes[i];
+                if (node.supported && ![node.type isEqualToString:@"shadowsocks"]) {
+                    pick = (NSInteger)i;
+                    break;
+                }
+            }
+            if (pick < 0) {
+                for (NSUInteger i = 0; i < _nodes.count; i++) {
+                    if (_nodes[i].supported) { pick = (NSInteger)i; break; }
+                }
+            }
+            _selectedIndex = pick >= 0 ? pick : 0;
+        }
 
         NSUInteger supported = 0;
         for (HVPNNode *node in _nodes) if (node.supported) supported++;

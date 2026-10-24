@@ -614,7 +614,11 @@ static NSString *HVPNPingText(HVPNNode *node) {
     }
 
     HVPNStore *store = [HVPNStore shared];
-    HVPNNode *node = [store nodeAtIndex:store.selectedIndex];
+    [self connectToNode:[store nodeAtIndex:store.selectedIndex]];
+}
+
+- (void)connectToNode:(HVPNNode *)node {
+    if (_busy) return;
     if (node == nil) {
         [self alert:@"Список пуст — добавьте ссылку или подписку."];
         return;
@@ -780,10 +784,15 @@ static NSString *HVPNPingText(HVPNNode *node) {
                     self->_statusLabel.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.15 alpha:1.0];
                     NSString *traffic = probe[@"ms"]
                         ? [NSString stringWithFormat:@" · %@ мс", probe[@"ms"]] : @"";
-                    self->_statusLabel.text = [NSString stringWithFormat:@"%@● %@ · %@ · %@%@",
+                    NSString *endpoint = status[@"server"]
+                        ? [NSString stringWithFormat:@"%@:%@", status[@"server"],
+                           status[@"port"] ?: @"?"]
+                        : @"";
+                    self->_statusLabel.text = [NSString stringWithFormat:@"%@● %@ · %@ · %@ · %@%@",
                                                warn,
                                                status[@"node"] ?: @"?",
                                                status[@"protocol"] ?: @"",
+                                               endpoint,
                                                status[@"utun"] ?: @"", traffic];
                 } else {
                     self->_statusLabel.textColor = versionMismatch
@@ -857,7 +866,9 @@ static NSString *HVPNPingText(HVPNNode *node) {
     [tableView reloadData];
 
     if ([_lastStatus[@"running"] boolValue]) {
-        [self alert:@"Нода выбрана. Нажмите «Отключить», затем «Подключить», чтобы применить."];
+        // Переподключаемся сразу: иначе туннель остался бы на старой ноде,
+        // а галочка уже стояла бы на новой.
+        [self connectToNode:node];
     }
 }
 
