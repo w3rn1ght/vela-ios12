@@ -87,6 +87,19 @@ static BOOL HVPNInterfaceReady(NSString *name) {
     return isUp && hasIPv4;
 }
 
+static BOOL HVPNInterfaceHasIPv6(NSString *name) {
+    if (name.length == 0) return NO;
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0) return NO;
+    BOOL found = NO;
+    for (struct ifaddrs *p = list; p != NULL; p = p->ifa_next) {
+        if (p->ifa_name == NULL || strcmp(p->ifa_name, name.UTF8String) != 0) continue;
+        if (p->ifa_addr != NULL && p->ifa_addr->sa_family == AF_INET6) { found = YES; break; }
+    }
+    freeifaddrs(list);
+    return found;
+}
+
 static NSString *HVPNNextTunName(void) {
     NSInteger maxIndex = -1;
     for (NSString *name in HVPNUtunNames()) {
@@ -291,30 +304,36 @@ static NSString *HVPNPrimaryInterface(void) {
         _nodeType = proxy.type;
         _startedAt = [NSDate date];
 
+        // 0. Снять всё, что осталось от прошлых сессий (иначе add даёт EEXIST).
+        [HVPNTunnel cleanupStaleRoutes];
         // 1. Сервер прокси должен ходить мимо tun, иначе петля.
         [self addHostRoutesForServerAddresses:serverAddresses];
         // 2. Заворачиваем весь IPv4/IPv6 в tun (split default).
         [self addInterfaceRoute:AF_INET dst:@"0.0.0.0" prefix:1 ifindex:ifindex];
         [self addInterfaceRoute:AF_INET dst:@"128.0.0.0" prefix:1 ifindex:ifindex];
-        if (serverAddresses.count > 0) {
+        BOOL tunnelIPv6 = (serverAddresses.count > 0) && HVPNInterfaceHasIPv6(utun);
+        if (tunnelIPv6) {
             [self addInterfaceRoute:AF_INET6 dst:@"::" prefix:1 ifindex:ifindex];
             [self addInterfaceRoute:AF_INET6 dst:@"8000::" prefix:1 ifindex:ifindex];
         } else {
-            // Сервер доступен только по IPv6 — v6 не заворачиваем, иначе получим петлю
-            // (IPv6 host-route пока не реализован). IPv4 при этом работает как обычно.
-            NSLog(@"[happvpnd] IPv6-сервер: v6-маршруты в tun не ставлю");
+            // Либо сервер только по IPv6, либо на utun нет IPv6-адреса — тогда
+            // ::/1 ставить бессмысленно (ENETUNREACH), IPv4 работает как обычно.
+            NSLog(@"[velad] IPv6 не заворачиваю (сервер v4: %@, tun v6: %@)",
+                  serverAddresses.count > 0 ? @"да" : @"нет",
+                  HVPNInterfaceHasIPv6(utun) ? @"да" : @"нет");
         }
 
         NSUInteger installedRoutes = _ifaceRoutes.count;
-        NSLog(@"[velad] маршрутов поставлено %lu из 4, проверка 0/1 -> ifindex %u (tun %u)",
-              (unsigned long)installedRoutes,
+        NSUInteger expectedRoutes = tunnelIPv6 ? 4 : 2;
+        NSLog(@"[velad] маршрутов поставлено %lu из %lu, проверка 0/1 -> ifindex %u (tun %u)",
+              (unsigned long)installedRoutes, (unsigned long)expectedRoutes,
               HVPNRouteInterfaceIndex(AF_INET, @"0.0.0.0", 1), ifindex);
         if (installedRoutes < 2) {
             [self stopLocked];
             return [self failure:[NSString stringWithFormat:
-                @"Не удалось поставить маршруты (получилось %lu из 4). Подробности: "
+                @"Не удалось поставить маршруты (получилось %lu из %lu). Подробности: "
                 @"/var/mobile/Library/Logs/Vela/daemon.log",
-                (unsigned long)installedRoutes]];
+                (unsigned long)installedRoutes, (unsigned long)expectedRoutes]];
         }
 
         return @{@"ok": @YES, @"status": [self status]};

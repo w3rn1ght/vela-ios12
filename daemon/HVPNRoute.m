@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -131,6 +132,40 @@ static BOOL HVPNParseAddr(int family, NSString *text, uint8_t out[16]) {
     return inet_pton(family, text.UTF8String, out) == 1;
 }
 
+// Darwin отдаёт маску маршрута «коротким» sockaddr (sa_len = 5/8, а не 16),
+// поэтому читаем только реально присутствующие байты и добиваем нулями.
+// Иначе любой /1-маршрут выглядит как маска 0 и поиск по таблице не находит его.
+static uint32_t HVPNIPv4MaskValue(struct sockaddr *sa) {
+    uint8_t bytes[4] = {0, 0, 0, 0};
+    if (sa != NULL) {
+        size_t offset = offsetof(struct sockaddr_in, sin_addr);
+        if (sa->sa_len > offset) {
+            size_t count = sa->sa_len - offset;
+            if (count > 4) count = 4;
+            memcpy(bytes, ((uint8_t *)sa) + offset, count);
+        }
+    }
+    uint32_t value;
+    memcpy(&value, bytes, sizeof(value));
+    return ntohl(value);
+}
+
+static void HVPNIPv6MaskValue(struct sockaddr *sa, uint8_t out[16]) {
+    memset(out, 0, 16);
+    if (sa == NULL) return;
+    size_t offset = offsetof(struct sockaddr_in6, sin6_addr);
+    if (sa->sa_len <= offset) return;
+    size_t count = sa->sa_len - offset;
+    if (count > 16) count = 16;
+    memcpy(out, ((uint8_t *)sa) + offset, count);
+}
+
+static uint32_t HVPNPrefixMask4(int prefix) {
+    if (prefix <= 0) return 0;
+    if (prefix >= 32) return 0xFFFFFFFFu;
+    return 0xFFFFFFFFu << (32 - prefix);
+}
+
 static BOOL HVPNRunRoute(NSArray<NSString *> *args) {
     static NSArray<NSString *> *candidates;
     static dispatch_once_t once;
@@ -177,11 +212,11 @@ static BOOL HVPNRouteViaCommand(BOOL add, int family, NSString *dst, int prefix,
     if (ifindex == 0 || if_indextoname(ifindex, name) == NULL) return NO;
 
     NSString *target = [NSString stringWithFormat:@"%@/%d", dst, prefix];
-    return HVPNRunRoute(@[
-        add ? @"add" : @"delete",
-        @"-net", target,
-        @"-interface", [NSString stringWithUTF8String:name]
-    ]);
+    if (!add) {
+        // Удаление по сети: ядро находит маршрут независимо от интерфейса.
+        return HVPNRunRoute(@[@"delete", @"-net", target]);
+    }
+    return HVPNRunRoute(@[@"add", @"-net", target, @"-interface", [NSString stringWithUTF8String:name]]);
 }
 
 static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefix,
@@ -189,26 +224,33 @@ static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefi
     uint8_t addr[16];
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
 
+    BOOL add = (cmd == HVPN_RTM_ADD);
+    NSString *target = [NSString stringWithFormat:@"%@/%d", dst, prefix];
+
     int result = HVPNRouteOp(cmd, family, addr, prefix, ifindex, gateway);
+
+    // Host-маршрут до сервера мог остаться от прошлой сессии — это не ошибка.
+    if (result != 0 && add && gateway.length > 0 && errno == EEXIST) return 0;
+
+    // Маршрут уже есть (обычно от прошлой сессии, на мёртвый utun).
+    // Удаляем по сети (без ifindex — так ядро находит его всегда) и пробуем снова.
+    if (result != 0 && add && gateway.length == 0 && errno == EEXIST) {
+        HVPNRunRoute(@[@"delete", @"-net", target]);
+        result = HVPNRouteOp(cmd, family, addr, prefix, ifindex, gateway);
+    }
     if (result == 0) return 0;
 
     int saved = errno;
-    BOOL add = (cmd == HVPN_RTM_ADD);
     BOOL fallback = NO;
     if (gateway.length == 0) {
         fallback = HVPNRouteViaCommand(add, family, dst, prefix, ifindex);
     } else {
-        // host-маршрут через шлюз: route add -host <ip> <gw>
-        fallback = HVPNRunRoute(@[
-            add ? @"add" : @"delete",
-            @"-host", dst,
-            gateway
-        ]);
+        fallback = HVPNRunRoute(@[add ? @"add" : @"delete", @"-host", dst, gateway]);
     }
 
     if (fallback) {
-        NSLog(@"[velad] маршрут %@/%d через ifindex %u поставлен через /sbin/route "
-              @"(PF_ROUTE дал: %s)", dst, prefix, ifindex, strerror(saved));
+        NSLog(@"[velad] маршрут %@ через ifindex %u поставлен через route(8) "
+              @"(PF_ROUTE дал: %s)", target, ifindex, strerror(saved));
         errno = 0;
         return 0;
     }
@@ -362,27 +404,20 @@ unsigned HVPNRouteInterfaceIndex(int family, NSString *dst, int prefix) {
 
         // Проверяем маску, иначе можно поймать другой маршрут с тем же адресом.
         if (family == AF_INET) {
-            uint32_t mask = 0;
-            if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in))
-                mask = ntohl(((struct sockaddr_in *)maskSA)->sin_addr.s_addr);
-            uint32_t want = (prefix <= 0) ? 0 : (0xFFFFFFFFu << (32 - prefix));
-            if (mask != want) continue;
+            if (HVPNIPv4MaskValue(maskSA) != HVPNPrefixMask4(prefix)) continue;
         } else {
             uint8_t mask[16];
-            memset(mask, 0, sizeof(mask));
-            if (maskSA && maskSA->sa_len >= sizeof(struct sockaddr_in6))
-                memcpy(mask, &((struct sockaddr_in6 *)maskSA)->sin6_addr, 16);
+            HVPNIPv6MaskValue(maskSA, mask);
+            uint8_t want[16];
+            memset(want, 0, sizeof(want));
             int full = prefix / 8;
-            for (int i = 0; i < 16; i++) {
-                uint8_t want = i < full ? 0xFF : (i == full && prefix % 8 ? (uint8_t)(0xFF << (8 - prefix % 8)) : 0);
-                if (mask[i] != want) { result = 0; goto next; }
-            }
+            for (int i = 0; i < 16 && i < full; i++) want[i] = 0xFF;
+            if (prefix % 8 && full < 16) want[full] = (uint8_t)(0xFF << (8 - prefix % 8));
+            if (memcmp(mask, want, 16) != 0) continue;
         }
 
         result = rtm->rtm_index;
         break;
-    next:
-        continue;
     }
 
     free(buf);
