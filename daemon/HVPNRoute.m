@@ -173,7 +173,10 @@ static BOOL HVPNRouteViaCommand(BOOL add, int family, NSString *dst, int prefix,
 
 static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefix,
                                    unsigned ifindex, NSString *gateway) {
-    int result = HVPNRouteOp(cmd, family, dst, prefix, ifindex, gateway);
+    uint8_t addr[16];
+    if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
+
+    int result = HVPNRouteOp(cmd, family, addr, prefix, ifindex, gateway);
     if (result == 0) return 0;
 
     int saved = errno;
