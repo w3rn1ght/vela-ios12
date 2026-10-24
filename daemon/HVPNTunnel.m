@@ -94,7 +94,10 @@ static BOOL HVPNInterfaceHasIPv6(NSString *name) {
     BOOL found = NO;
     for (struct ifaddrs *p = list; p != NULL; p = p->ifa_next) {
         if (p->ifa_name == NULL || strcmp(p->ifa_name, name.UTF8String) != 0) continue;
-        if (p->ifa_addr != NULL && p->ifa_addr->sa_family == AF_INET6) { found = YES; break; }
+        if (p->ifa_addr != NULL && p->ifa_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)p->ifa_addr;
+            if (!IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) { found = YES; break; }
+        }
     }
     freeifaddrs(list);
     return found;
@@ -305,6 +308,9 @@ static NSString *HVPNPrimaryInterface(void) {
         _startedAt = [NSDate date];
 
         // 0. Снять всё, что осталось от прошлых сессий (иначе add даёт EEXIST).
+        NSLog(@"[velad] tun %@, ifindex %u, route(8): %@", utun, ifindex,
+              HVPNRouteBinaryPath() ?: @"не найден");
+        HVPNRouteLogConflicts();
         [HVPNTunnel cleanupStaleRoutes];
         // 1. Сервер прокси должен ходить мимо tun, иначе петля.
         [self addHostRoutesForServerAddresses:serverAddresses];

@@ -49,9 +49,6 @@ static NSDictionary *HVPNHandleRequest(NSDictionary *request) {
     NSString *cmd = request[@"cmd"];
     HVPNTunnel *tunnel = [HVPNTunnel shared];
 
-    if ([cmd isEqualToString:@"ping"]) {
-        return @{@"ok": @YES, @"version": HVPNVersionString, @"pid": @(getpid())};
-    }
     if ([cmd isEqualToString:@"status"]) {
         return @{@"ok": @YES, @"version": HVPNVersionString, @"status": [tunnel status]};
     }

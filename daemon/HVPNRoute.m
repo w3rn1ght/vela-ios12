@@ -22,8 +22,8 @@ NSString *HVPNErrnoString(void) {
     return [NSString stringWithUTF8String:strerror(errno)] ?: @"unknown error";
 }
 
-static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
-                       unsigned ifindex, NSString *gateway) {
+static int HVPNRouteOpEx(int cmd, int family, const void *dst, int prefix,
+                         unsigned ifindex, NSString *gateway, BOOL withGateway) {
     int fd = socket(PF_ROUTE, SOCK_RAW, family == AF_INET6 ? AF_INET6 : AF_INET);
     if (fd < 0) return -1;
 
@@ -37,7 +37,8 @@ static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
     rtm->rtm_version = HVPN_RTM_VERSION;
     rtm->rtm_type = (u_char)cmd;
     rtm->rtm_flags = HVPN_RTF_UP | HVPN_RTF_STATIC;
-    rtm->rtm_addrs = HVPN_RTA_DST | HVPN_RTA_NETMASK | HVPN_RTA_GATEWAY;
+    rtm->rtm_addrs = HVPN_RTA_DST | HVPN_RTA_NETMASK;
+    if (withGateway) rtm->rtm_addrs |= HVPN_RTA_GATEWAY;
 
     if (family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)cp;
@@ -76,7 +77,9 @@ static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
         len += (int)sizeof(struct sockaddr_in6);
     }
 
-    if (gateway.length) {
+    if (!withGateway) {
+        // Удаление идёт без RTA_GATEWAY: ядро ищет запись по dst+mask.
+    } else if (gateway.length) {
         if (family == AF_INET) {
             struct sockaddr_in *sin = (struct sockaddr_in *)cp;
             sin->sin_len = sizeof(struct sockaddr_in);
@@ -145,9 +148,10 @@ static uint32_t HVPNIPv4MaskValue(struct sockaddr *sa) {
             memcpy(bytes, ((uint8_t *)sa) + offset, count);
         }
     }
-    uint32_t value;
-    memcpy(&value, bytes, sizeof(value));
-    return ntohl(value);
+    // Байты маски идут в сетевом порядке, поэтому собираем вручную:
+    // для короткой маски (sa_len = 6) ntohl дал бы неверный результат.
+    return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
 }
 
 static void HVPNIPv6MaskValue(struct sockaddr *sa, uint8_t out[16]) {
@@ -164,6 +168,15 @@ static uint32_t HVPNPrefixMask4(int prefix) {
     if (prefix <= 0) return 0;
     if (prefix >= 32) return 0xFFFFFFFFu;
     return 0xFFFFFFFFu << (32 - prefix);
+}
+
+static int HVPNRouteOp(int cmd, int family, const void *dst, int prefix,
+                       unsigned ifindex, NSString *gateway) {
+    return HVPNRouteOpEx(cmd, family, dst, prefix, ifindex, gateway, YES);
+}
+
+static int HVPNRouteDeleteOp(int family, const void *dst, int prefix, unsigned ifindex) {
+    return HVPNRouteOpEx(HVPN_RTM_DELETE, family, dst, prefix, ifindex, nil, NO);
 }
 
 static BOOL HVPNRunRoute(NSArray<NSString *> *args) {
@@ -227,16 +240,27 @@ static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefi
     BOOL add = (cmd == HVPN_RTM_ADD);
     NSString *target = [NSString stringWithFormat:@"%@/%d", dst, prefix];
 
-    int result = HVPNRouteOp(cmd, family, addr, prefix, ifindex, gateway);
+    int result;
+    if (add) {
+        result = HVPNRouteOp(HVPN_RTM_ADD, family, addr, prefix, ifindex, gateway);
 
-    // Host-маршрут до сервера мог остаться от прошлой сессии — это не ошибка.
-    if (result != 0 && add && gateway.length > 0 && errno == EEXIST) return 0;
-
-    // Маршрут уже есть (обычно от прошлой сессии, на мёртвый utun).
-    // Удаляем по сети (без ifindex — так ядро находит его всегда) и пробуем снова.
-    if (result != 0 && add && gateway.length == 0 && errno == EEXIST) {
-        HVPNRunRoute(@[@"delete", @"-net", target]);
-        result = HVPNRouteOp(cmd, family, addr, prefix, ifindex, gateway);
+        if (result != 0 && errno == EEXIST && gateway.length > 0) {
+            // Host-маршрут до сервера уже стоит — это нормально.
+            return 0;
+        }
+        if (result != 0 && errno == EEXIST) {
+            // Маршрут уже есть: скорее всего остался от прошлой сессии.
+            // Снимаем его (по сети, без привязки к интерфейсу) и ставим заново.
+            NSLog(@"[velad] %@ уже есть (ifindex %u), снимаю и ставлю заново",
+                  target, HVPNRouteInterfaceIndex(family, dst, prefix));
+            HVPNRouteDeleteOp(family, addr, prefix, 0);
+            HVPNRouteDeleteOp(family, addr, prefix, ifindex);
+            HVPNRunRoute(@[@"delete", @"-net", target]);
+            result = HVPNRouteOp(HVPN_RTM_ADD, family, addr, prefix, ifindex, gateway);
+        }
+    } else {
+        result = HVPNRouteDeleteOp(family, addr, prefix, 0);
+        if (result != 0) result = HVPNRouteDeleteOp(family, addr, prefix, ifindex);
     }
     if (result == 0) return 0;
 
@@ -249,7 +273,7 @@ static int HVPNRouteOpWithFallback(int cmd, int family, NSString *dst, int prefi
     }
 
     if (fallback) {
-        NSLog(@"[velad] маршрут %@ через ifindex %u поставлен через route(8) "
+        NSLog(@"[velad] маршрут %@ через ifindex %u выставлен через route(8) "
               @"(PF_ROUTE дал: %s)", target, ifindex, strerror(saved));
         errno = 0;
         return 0;
@@ -282,6 +306,73 @@ int HVPNRouteDeleteHost(int family, NSString *dst, NSString *gateway, unsigned i
     if (!HVPNParseAddr(family, dst, addr)) { errno = EINVAL; return -1; }
     return HVPNRouteOpWithFallback(HVPN_RTM_DELETE, family, dst, family == AF_INET ? 32 : 128,
                                    ifindex, gateway);
+}
+
+NSString *HVPNRouteBinaryPath(void) {
+    static NSArray<NSString *> *candidates;
+    static dispatch_once_t once;
+    static NSString *found = nil;
+    dispatch_once(&once, ^{
+        candidates = @[@"/sbin/route", @"/usr/sbin/route", @"/bin/route", @"/usr/local/bin/route"];
+        for (NSString *path in candidates) {
+            if ([[NSFileManager defaultManager] isExecutableFileAtPath:path]) {
+                found = path;
+                break;
+            }
+        }
+    });
+    return found;
+}
+
+// Печатает в daemon.log маршруты, которые могут конфликтовать с нашими 0/1 и 128/1.
+// Нужно, чтобы по логу было видно, кто именно держит маршрут.
+void HVPNRouteLogConflicts(void) {
+    int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0};
+    size_t needed = 0;
+    if (sysctl(mib, 6, NULL, &needed, NULL, 0) < 0 || needed == 0) {
+        NSLog(@"[velad] таблица маршрутов недоступна: %s", strerror(errno));
+        return;
+    }
+    char *buf = malloc(needed);
+    if (buf == NULL) return;
+    if (sysctl(mib, 6, buf, &needed, NULL, 0) < 0) { free(buf); return; }
+
+    char *p = buf;
+    char *end = buf + needed;
+    while (p + sizeof(struct hvpn_rt_msghdr) <= end) {
+        struct hvpn_rt_msghdr *rtm = (struct hvpn_rt_msghdr *)p;
+        if (rtm->rtm_msglen == 0) break;
+        p += rtm->rtm_msglen;
+        if (rtm->rtm_type != HVPN_RTM_GET) continue;
+
+        struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
+        struct sockaddr *dstSA = NULL, *maskSA = NULL;
+        for (int i = 1; i <= HVPN_RTAX_MAX; i++) {
+            if (!(rtm->rtm_addrs & (1 << (i - 1)))) continue;
+            if (sa->sa_len == 0) break;
+            if (i == 1) dstSA = sa;
+            if (i == 4) maskSA = sa;
+            sa = (struct sockaddr *)((char *)sa + HVPN_ROUNDUP(sa->sa_len));
+        }
+        if (dstSA == NULL || dstSA->sa_family != AF_INET) continue;
+
+        struct sockaddr_in *d = (struct sockaddr_in *)dstSA;
+        uint32_t dstValue = ntohl(d->sin_addr.s_addr);
+        uint32_t mask = HVPNIPv4MaskValue(maskSA);
+        BOOL interesting = (dstValue == 0 || dstValue == 0x80000000u) &&
+                           (mask == 0 || mask == 0x80000000u);
+        if (!interesting) continue;
+
+        char name[IFNAMSIZ];
+        memset(name, 0, sizeof(name));
+        if (if_indextoname(rtm->rtm_index, name) == NULL) strcpy(name, "?");
+
+        char text[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &d->sin_addr, text, sizeof(text));
+        NSLog(@"[velad] в таблице: %s mask=0x%08x -> ifindex %u (%s) flags=0x%x",
+              text, mask, rtm->rtm_index, name, rtm->rtm_flags);
+    }
+    free(buf);
 }
 
 BOOL HVPNGetDefaultGateway(int family, NSString **gateway, unsigned *ifindex) {

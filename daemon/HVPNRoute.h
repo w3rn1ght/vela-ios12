@@ -17,6 +17,12 @@ BOOL HVPNGetDefaultGateway(int family, NSString *_Nullable *_Nullable gateway, u
 /// Индекс интерфейса, через который идёт маршрут dst/prefix (0 — не найден).
 unsigned HVPNRouteInterfaceIndex(int family, NSString *dst, int prefix);
 
+/// Путь к рабочий route(8) или nil, если в системе его нет.
+NSString *_Nullable HVPNRouteBinaryPath(void);
+
+/// Пишет в лог маршруты, конфликтующие с 0.0.0.0/1 и 128.0.0.0/1.
+void HVPNRouteLogConflicts(void);
+
 /// Текст последней ошибки (errno), для логов.
 NSString *HVPNErrnoString(void);
 
