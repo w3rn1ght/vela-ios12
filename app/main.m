@@ -12,6 +12,11 @@
 
 #import "HVPNConfig.h"
 #include <netdb.h>
+#include <net/if.h>
+
+#ifndef IP_BOUND_IF
+#define IP_BOUND_IF 25
+#endif
 #include <arpa/inet.h>
 #import "HVPNLinkParser.h"
 #import "HVPNPaths.h"
@@ -539,16 +544,26 @@ static NSString *HVPNPingText(HVPNNode *node) {
 }
 
 - (NSString *)dnsProbe:(NSString *)name qtype:(int)qtype {
+    return [self dnsProbe:name qtype:qtype server:@"1.1.1.1" ifname:nil];
+}
+
+// server — адрес DNS; ifname — привязать сокет к интерфейсу (IP_BOUND_IF), чтобы
+// заглянуть мимо туннеля и увидеть, что реально отвечает сеть.
+- (NSString *)dnsProbe:(NSString *)name qtype:(int)qtype server:(NSString *)server ifname:(NSString *)ifname {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return @"socket() не удался";
     struct timeval tv = {5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (ifname.length) {
+        unsigned index = if_nametoindex(ifname.UTF8String);
+        if (index) setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, sizeof(index));
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(53);
-    inet_pton(AF_INET, "1.1.1.1", &addr.sin_addr);
+    inet_pton(AF_INET, server.UTF8String, &addr.sin_addr);
 
     uint8_t query[512];
     NSUInteger n = 0;
@@ -596,7 +611,8 @@ static NSString *HVPNPingText(HVPNNode *node) {
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         struct addrinfo *res = NULL;
-        if (getaddrinfo("www.youtube.com", "443", &hints, &res) == 0) {
+        int gaiRC = getaddrinfo("www.youtube.com", "443", &hints, &res);
+        if (gaiRC == 0) {
             NSMutableArray *v4 = [NSMutableArray array];
             NSMutableArray *v6 = [NSMutableArray array];
             for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
@@ -616,7 +632,29 @@ static NSString *HVPNPingText(HVPNNode *node) {
             if (v6.count) [out appendFormat:@"\n  AAAA: %@", [v6 componentsJoinedByString:@", "]];
             [out appendString:@"\n"];
         } else {
-            [out appendString:@"DNS www.youtube.com: не разрешился\n"];
+            [out appendFormat:@"DNS www.youtube.com: не разрешился (gai=%d: %s)\n", gaiRC,
+                              gai_strerror(gaiRC)];
+        }
+
+        // Куда система шлёт запросы на самом деле и что отвечает её DNS.
+        NSMutableArray<NSString *> *resolvers = [NSMutableArray array];
+        NSString *resolv = [NSString stringWithContentsOfFile:@"/etc/resolv.conf"
+                                                     encoding:NSUTF8StringEncoding
+                                                        error:NULL];
+        NSCharacterSet *spaces = [NSCharacterSet whitespaceCharacterSet];
+        for (NSString *line in [resolv componentsSeparatedByString:@"\n"]) {
+            NSString *trimmed = [line stringByTrimmingCharactersInSet:spaces];
+            if (![trimmed hasPrefix:@"nameserver"]) continue;
+            NSArray<NSString *> *parts = [trimmed componentsSeparatedByCharactersInSet:spaces];
+            if (parts.count >= 2) [resolvers addObject:parts[1]];
+        }
+        [out appendFormat:@"резолвер системы: %@\n",
+            resolvers.count ? [resolvers componentsJoinedByString:@", "] : @"не прочитать"];
+        for (NSString *srv in resolvers) {
+            if ([srv rangeOfString:@"."].location == NSNotFound) continue;   // IPv6 пропускаем
+            [out appendFormat:@"  %@ мимо туннеля (en0): youtube A -> %@, ytimg A -> %@\n", srv,
+                [self dnsProbe:@"www.youtube.com" qtype:1 server:srv ifname:@"en0"],
+                [self dnsProbe:@"i.ytimg.com" qtype:1 server:srv ifname:@"en0"]];
         }
 
         [out appendFormat:@"DNS-модуль (запрос в 1.1.1.1:53 через туннель):\n"];

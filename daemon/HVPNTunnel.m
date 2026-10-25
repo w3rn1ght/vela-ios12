@@ -131,22 +131,29 @@ static NSString *HVPNNextTunName(void) {
 // SystemConfiguration на iOS недоступен, поэтому берём индекс из таблицы маршрутов.
 
 // DNS физической сети: без него «local»-сервер может быть недоступен.
-static NSString *HVPNSystemDNS(void) {
+static NSArray<NSString *> *HVPNSystemDNSList(void) {
     NSString *text = [NSString stringWithContentsOfFile:@"/etc/resolv.conf"
                                                encoding:NSUTF8StringEncoding
                                                   error:NULL];
-    if (text.length == 0) return nil;
+    if (text.length == 0) return @[];
     NSCharacterSet *spaces = [NSCharacterSet whitespaceCharacterSet];
+    NSMutableArray<NSString *> *servers = [NSMutableArray array];
     for (NSString *line in [text componentsSeparatedByCharactersInSet:
                             [NSCharacterSet newlineCharacterSet]]) {
         NSString *trimmed = [line stringByTrimmingCharactersInSet:spaces];
         if (![trimmed hasPrefix:@"nameserver"]) continue;
         NSArray<NSString *> *parts = [trimmed componentsSeparatedByCharactersInSet:spaces];
-        if (parts.count >= 2 && [parts[1] rangeOfString:@"."].location != NSNotFound) {
-            return parts[1];
-        }
+        if (parts.count < 2) continue;
+        NSString *server = parts[1];
+        if ([server rangeOfString:@"."].location == NSNotFound &&
+            [server rangeOfString:@":"].location == NSNotFound) continue;
+        if (![servers containsObject:server]) [servers addObject:server];
     }
-    return nil;
+    return servers;
+}
+
+static NSString *HVPNSystemDNS(void) {
+    return HVPNSystemDNSList().firstObject;
 }
 
 // Сквозная проверка туннеля. connect() сам по себе ничего не доказывает: gvisor
@@ -297,6 +304,21 @@ static NSString *HVPNPrimaryInterface(void) {
             NSLog(@"[velad] снят оставшийся маршрут %@/%d (ifindex %u)", dst, prefix, index);
         } else {
             NSLog(@"[velad] не удалось снять %@/%d: %@", dst, prefix, HVPNErrnoString());
+        }
+    }
+
+    // Завёрнутые в tun DNS-серверы сети: если демон упал, запросы на роутер уходят
+    // в мёртвый utun и DNS не работает вообще. Снимаем такие маршруты.
+    for (NSString *server in HVPNSystemDNSList()) {
+        BOOL v6 = [server rangeOfString:@":"].location != NSNotFound;
+        int family = v6 ? AF_INET6 : AF_INET;
+        int prefix = v6 ? 128 : 32;
+        unsigned index = HVPNRouteInterfaceIndex(family, server, prefix);
+        if (index == 0) continue;
+        char name[IFNAMSIZ] = {0};
+        if (if_indextoname(index, name) == NULL || strncmp(name, "utun", 4) != 0) continue;
+        if (HVPNRouteDeleteInterface(family, server, prefix, index) == 0) {
+            NSLog(@"[velad] снят оставшийся DNS-маршрут %@/32 (ifindex %u)", server, index);
         }
     }
 }
@@ -474,6 +496,13 @@ static NSString *HVPNPrimaryInterface(void) {
                   serverAddresses.count > 0 ? @"да" : @"нет",
                   HVPNInterfaceHasIPv6(utun) ? @"да" : @"нет");
         }
+
+        // 3. DNS-серверы физической сети заворачиваем в tun. Своего DNS у utun нет,
+        // поэтому iOS шлёт запросы прямо на роутер, мимо VPN; если провайдер или
+        // роутер фильтрует имена (youtube.com), приложение получает «host not found»,
+        // хотя через прокси то же имя резолвится. Завёрнутые пакеты подхватит
+        // правило hijack-dns и отдаст их DNS-модулю ядра.
+        [self addRoutesForSystemDNS:ifindex includeIPv6:tunnelIPv6];
 
         NSUInteger installedRoutes = _ifaceRoutes.count;
         NSUInteger expectedRoutes = tunnelIPv6 ? 4 : 2;
@@ -654,6 +683,18 @@ static NSString *HVPNPrimaryInterface(void) {
         usleep(150 * 1000);
     }
     return NO;
+}
+
+- (void)addRoutesForSystemDNS:(unsigned)ifindex includeIPv6:(BOOL)includeIPv6 {
+    for (NSString *server in HVPNSystemDNSList()) {
+        BOOL v6 = [server rangeOfString:@":"].location != NSNotFound;
+        if (v6 && !includeIPv6) continue;
+        int family = v6 ? AF_INET6 : AF_INET;
+        int prefix = v6 ? 128 : 32;
+        if ([self addInterfaceRoute:family dst:server prefix:prefix ifindex:ifindex]) {
+            NSLog(@"[velad] DNS %@ завёрнут в туннель", server);
+        }
+    }
 }
 
 - (void)addHostRoutesForServerAddresses:(NSArray<NSString *> *)addresses {
