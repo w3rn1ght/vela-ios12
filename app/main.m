@@ -13,6 +13,7 @@
 #import "HVPNConfig.h"
 #include <netdb.h>
 #include <net/if.h>
+#include <dlfcn.h>
 
 #ifndef IP_BOUND_IF
 #define IP_BOUND_IF 25
@@ -543,6 +544,52 @@ static NSString *HVPNPingText(HVPNNode *node) {
             (http.statusCode >= 400 && head.length) ? [@" — " stringByAppendingString:head] : @""];
 }
 
+// Хвост лога ядра: нужен, чтобы увидеть, что ядро записало во время резолва.
+- (NSString *)coreLogTail:(NSUInteger)count {
+    NSDictionary *response = HVPNSend(@{@"cmd": @"log"}, NULL, 10);
+    NSString *log = [response[@"log"] isKindOfClass:[NSString class]] ? response[@"log"] : @"";
+    if (log.length == 0) return @"  (лог пуст)\n";
+    NSArray<NSString *> *lines = [log componentsSeparatedByString:@"\n"];
+    NSMutableArray<NSString *> *tail = [NSMutableArray array];
+    for (NSInteger i = (NSInteger)lines.count - 1; i >= 0 && tail.count < count; i--) {
+        if (lines[i].length) [tail insertObject:lines[i] atIndex:0];
+    }
+    NSMutableString *text = [NSMutableString string];
+    for (NSString *line in tail) [text appendFormat:@"  %@\n", line];
+    return text;
+}
+
+// Настоящая конфигурация резолверов iOS: список серверов, привязка к интерфейсу
+// (if_index) и флаги (scoped). Так видно, ходит ли система мимо туннеля.
+- (NSString *)resolverConfigSummary {
+    typedef CFArrayRef (*CopyFn)(void);
+    typedef void (*FreeFn)(CFArrayRef);
+    CopyFn copyFn = (CopyFn)dlsym(RTLD_DEFAULT, "dns_configuration_copy");
+    FreeFn freeFn = (FreeFn)dlsym(RTLD_DEFAULT, "dns_configuration_free");
+    if (copyFn == NULL) return @"  (dns_configuration_copy недоступен)\n";
+    CFArrayRef configs = copyFn();
+    if (configs == NULL) return @"  (пусто)\n";
+
+    NSMutableString *text = [NSMutableString string];
+    CFIndex count = CFArrayGetCount(configs);
+    for (CFIndex i = 0; i < count; i++) {
+        NSDictionary *cfg = (__bridge NSDictionary *)CFArrayGetValueAtIndex(configs, i);
+        if (![cfg isKindOfClass:[NSDictionary class]]) continue;
+        NSArray *servers = [cfg[@"nameserver"] isKindOfClass:[NSArray class]] ? cfg[@"nameserver"] : @[];
+        NSNumber *ifIndex = [cfg[@"if_index"] isKindOfClass:[NSNumber class]] ? cfg[@"if_index"] : @0;
+        NSNumber *flags = [cfg[@"flags"] isKindOfClass:[NSNumber class]] ? cfg[@"flags"] : @0;
+        NSNumber *order = [cfg[@"search_order"] isKindOfClass:[NSNumber class]] ? cfg[@"search_order"] : @0;
+        char name[IFNAMSIZ] = {0};
+        if (ifIndex.unsignedIntValue > 0) if_indextoname(ifIndex.unsignedIntValue, name);
+        [text appendFormat:@"  #%ld if=%@(%u) flags=%u order=%@ dns=%@\n",
+            (long)(i + 1), name[0] ? [NSString stringWithUTF8String:name] : @"-",
+            ifIndex.unsignedIntValue, flags.unsignedIntValue, order,
+            servers.count ? [servers componentsJoinedByString:@","] : @"-"];
+    }
+    if (freeFn != NULL) freeFn(configs);
+    return text;
+}
+
 - (NSString *)dnsProbe:(NSString *)name qtype:(int)qtype {
     return [self dnsProbe:name qtype:qtype server:@"1.1.1.1" ifname:nil];
 }
@@ -636,26 +683,32 @@ static NSString *HVPNPingText(HVPNNode *node) {
                               gai_strerror(gaiRC)];
         }
 
-        // Куда система шлёт запросы на самом деле и что отвечает её DNS.
-        NSMutableArray<NSString *> *resolvers = [NSMutableArray array];
-        NSString *resolv = [NSString stringWithContentsOfFile:@"/etc/resolv.conf"
-                                                     encoding:NSUTF8StringEncoding
-                                                        error:NULL];
-        NSCharacterSet *spaces = [NSCharacterSet whitespaceCharacterSet];
-        for (NSString *line in [resolv componentsSeparatedByString:@"\n"]) {
-            NSString *trimmed = [line stringByTrimmingCharactersInSet:spaces];
-            if (![trimmed hasPrefix:@"nameserver"]) continue;
-            NSArray<NSString *> *parts = [trimmed componentsSeparatedByCharactersInSet:spaces];
-            if (parts.count >= 2) [resolvers addObject:parts[1]];
+        // Настоящая конфигурация резолверов (scoped/нет, к какому интерфейсу).
+        [out appendString:@"резолверы системы (dns_configuration_copy):\n"];
+        [out appendString:[self resolverConfigSummary]];
+
+        // Одно и то же имя в разных видах: видно, блокировка по имени или по домену.
+        for (NSString *host in @[@"youtube.com", @"www.youtube.com", @"m.youtube.com", @"youtu.be"]) {
+            struct addrinfo h;
+            memset(&h, 0, sizeof(h));
+            h.ai_family = AF_UNSPEC;
+            h.ai_socktype = SOCK_STREAM;
+            struct addrinfo *r = NULL;
+            int rc = getaddrinfo(host.UTF8String, "443", &h, &r);
+            if (rc == 0) {
+                NSUInteger count = 0;
+                for (struct addrinfo *p = r; p != NULL; p = p->ai_next) count++;
+                freeaddrinfo(r);
+                [out appendFormat:@"  getaddrinfo %@: ок, адресов %lu\n", host, (unsigned long)count];
+            } else {
+                [out appendFormat:@"  getaddrinfo %@: gai=%d (%s)\n", host, rc, gai_strerror(rc)];
+            }
         }
-        [out appendFormat:@"резолвер системы: %@\n",
-            resolvers.count ? [resolvers componentsJoinedByString:@", "] : @"не прочитать"];
-        for (NSString *srv in resolvers) {
-            if ([srv rangeOfString:@"."].location == NSNotFound) continue;   // IPv6 пропускаем
-            [out appendFormat:@"  %@ мимо туннеля (en0): youtube A -> %@, ytimg A -> %@\n", srv,
-                [self dnsProbe:@"www.youtube.com" qtype:1 server:srv ifname:@"en0"],
-                [self dnsProbe:@"i.ytimg.com" qtype:1 server:srv ifname:@"en0"]];
-        }
+
+        // Что ядро успело записать, пока система резолвила выше: если строк нет,
+        // запросы до туннеля не доходят.
+        [out appendString:@"лог ядра сразу после резолва:\n"];
+        [out appendString:[self coreLogTail:8]];
 
         [out appendFormat:@"DNS-модуль (запрос в 1.1.1.1:53 через туннель):\n"];
         [out appendFormat:@"  www.youtube.com A:    %@\n", [self dnsProbe:@"www.youtube.com" qtype:1]];

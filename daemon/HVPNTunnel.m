@@ -22,6 +22,7 @@
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <crt_externs.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 
 static NSString *const kBaseDir = HVPNStateDir;
 static NSString *const kConfigPath = HVPNCoreConfigPath;
@@ -45,14 +46,143 @@ static NSArray<NSString *> *HVPNUtunNames(void) {
 static void HVPNFlushDNSCache(void) {
     pid_t pid = 0;
     const char *path = "/usr/bin/killall";
-    char *const argv[] = {(char *const)"killall", (char *const)"-HUP", (char *const)"mDNSResponder", NULL};
+    char *const argv[] = {(char *const)"killall", (char *const)"-TERM", (char *const)"mDNSResponder", NULL};
     if (posix_spawn(&pid, path, NULL, NULL, argv, NULL) != 0) {
         NSLog(@"[velad] не удалось сбросить кеш DNS (posix_spawn killall)");
         return;
     }
     int status = 0;
     waitpid(pid, &status, 0);
-    NSLog(@"[velad] кеш DNS сброшен (mDNSResponder HUP, статус %d)", status);
+    NSLog(@"[velad] кеш DNS сброшен (mDNSResponder перезапущен, статус %d)", status);
+}
+
+// Простейший DNS-пакет: нужен для проверки, что локальный листенер жив.
+static NSData *HVPNDNSQueryPacket(NSString *name, uint16_t qtype) {
+    NSMutableData *packet = [NSMutableData data];
+    uint16_t ident = (uint16_t)arc4random_uniform(0xffff);
+    uint8_t header[12] = {(uint8_t)(ident >> 8), (uint8_t)(ident & 0xff), 0x01, 0x00,
+                          0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    [packet appendBytes:header length:sizeof(header)];
+    for (NSString *part in [name componentsSeparatedByString:@"."]) {
+        NSData *chunk = [part dataUsingEncoding:NSUTF8StringEncoding];
+        if (chunk.length == 0 || chunk.length > 63) return nil;
+        uint8_t length = (uint8_t)chunk.length;
+        [packet appendBytes:&length length:1];
+        [packet appendData:chunk];
+    }
+    uint8_t tail[5] = {0x00, (uint8_t)(qtype >> 8), (uint8_t)(qtype & 0xff), 0x00, 0x01};
+    [packet appendBytes:tail length:sizeof(tail)];
+    return packet;
+}
+
+// Свободны ли 127.0.0.1:53 (UDP и TCP) — проверяем ДО запуска ядра, иначе bind
+// внутри sing-box убивает старт целиком.
+static BOOL HVPNLocalDNSPortFree(void) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(53);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    int udp = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp < 0) return NO;
+    BOOL udpFree = bind(udp, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(udp);
+    if (!udpFree) return NO;
+
+    int tcp = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp < 0) return NO;
+    BOOL tcpFree = bind(tcp, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(tcp);
+    return tcpFree;
+}
+
+static BOOL HVPNLocalDNSResponds(void) {
+    NSData *query = HVPNDNSQueryPacket(@"example.com", 1);
+    if (query == nil) return NO;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return NO;
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(53);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    sendto(fd, query.bytes, query.length, 0, (struct sockaddr *)&addr, sizeof(addr));
+    uint8_t reply[512];
+    ssize_t got = recv(fd, reply, sizeof(reply), 0);
+    close(fd);
+    return got >= 12;
+}
+
+static NSString *HVPNDNSBackupPath(void) {
+    return [HVPNStateDir stringByAppendingPathComponent:@"dns-backup.json"];
+}
+
+static NSDictionary *HVPNReadDNSBackup(void) {
+    NSData *data = [NSData dataWithContentsOfFile:HVPNDNSBackupPath()];
+    if (data == nil) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+}
+
+// Подменяет адрес системного резолвера на локальный листенер ядра.
+// ВАЖНО: перед вызовом запросы должны попадать в DNS-модуль (hijack-dns).
+static void HVPNRouteSystemDNSToLocal(NSString *server) {
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("velad"), NULL, NULL);
+    if (store == NULL) {
+        NSLog(@"[velad] SCDynamicStore недоступен, резолвер не меняю");
+        return;
+    }
+
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    [keys addObject:@"State:/Network/Global/DNS"];
+    CFPropertyListRef globalIPv4 = SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/IPv4"));
+    if (globalIPv4 != NULL) {
+        NSDictionary *info = CFBridgingRelease(globalIPv4);
+        NSString *service = info[@"PrimaryService"];
+        if ([service isKindOfClass:[NSString class]] && service.length > 0) {
+            [keys addObject:[NSString stringWithFormat:@"State:/Network/Service/%@/DNS", service]];
+        }
+    }
+
+    // Исходные значения сохраняем один раз: вернём их при отключении (и после падения).
+    if (HVPNReadDNSBackup() == nil) {
+        NSMutableDictionary *backup = [NSMutableDictionary dictionary];
+        for (NSString *key in keys) {
+            CFPropertyListRef old = SCDynamicStoreCopyValue(store, (__bridge CFStringRef)key);
+            if (old != NULL) backup[key] = CFBridgingRelease(old);
+        }
+        NSData *json = [NSJSONSerialization dataWithJSONObject:backup options:0 error:NULL];
+        [json writeToFile:HVPNDNSBackupPath() atomically:YES];
+    }
+
+    NSDictionary *value = @{@"ServerAddresses": @[server]};
+    for (NSString *key in keys) {
+        BOOL ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)key,
+                                         (__bridge CFDictionaryRef)value);
+        NSLog(@"[velad] резолвер %@ -> %@: %@", key, server, ok ? @"ок" : @"отказ");
+    }
+    CFRelease(store);
+}
+
+// Возврат исходного резолвера. Вызывается и при старте демона: если прошлый запуск
+// умер с подменённым резолвером, иначе DNS останется смотреть в мёртвый листенер.
+static void HVPNRestoreSystemDNS(void) {
+    NSDictionary *backup = HVPNReadDNSBackup();
+    if (backup == nil) return;
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("velad"), NULL, NULL);
+    if (store == NULL) return;
+    for (NSString *key in backup) {
+        NSDictionary *value = backup[key];
+        if (![value isKindOfClass:[NSDictionary class]]) continue;
+        BOOL ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)key,
+                                         (__bridge CFDictionaryRef)value);
+        NSLog(@"[velad] резолвер %@ восстановлен: %@", key, ok ? @"ок" : @"отказ");
+    }
+    CFRelease(store);
+    [[NSFileManager defaultManager] removeItemAtPath:HVPNDNSBackupPath() error:NULL];
 }
 
 static NSArray<NSString *> *HVPNResolveIPv4(NSString *host) {
@@ -147,6 +277,7 @@ static NSArray<NSString *> *HVPNSystemDNSList(void) {
         NSString *server = parts[1];
         if ([server rangeOfString:@"."].location == NSNotFound &&
             [server rangeOfString:@":"].location == NSNotFound) continue;
+        if ([server isEqualToString:@"127.0.0.1"] || [server isEqualToString:@"::1"]) continue;
         if (![servers containsObject:server]) [servers addObject:server];
     }
     return servers;
@@ -412,8 +543,14 @@ static NSString *HVPNPrimaryInterface(void) {
         }
 
         NSMutableDictionary *opts = [options mutableCopy] ?: [NSMutableDictionary dictionary];
-        NSString *systemDNS = HVPNSystemDNS();
-        if (systemDNS.length) opts[@"dnsLocal"] = systemDNS;
+        // Локальный DNS в ядре: iOS резолвит имена мимо tun, и его резолвер в РФ
+        // отдаёт поддельный NXDOMAIN на youtube.com. Порт проверяем до старта ядра.
+        BOOL localDNS = HVPNLocalDNSPortFree();
+        opts[@"localDNS"] = @(localDNS);
+        NSLog(@"[velad] локальный DNS 127.0.0.1:53: %@", localDNS ? @"будет включён" : @"порт занят");
+        // Явно, без фолбэка на 223.5.5.5: если своего DNS у сети нет, конфиг
+        // резолвит всё через прокси, а не в недоступный сервер.
+        opts[@"dnsLocal"] = HVPNSystemDNS() ?: @"";
         opts[@"logPath"] = kCoreLogPath;
         NSString *tunName = HVPNNextTunName();
         opts[@"interfaceName"] = tunName;
@@ -547,6 +684,17 @@ static NSString *HVPNPrimaryInterface(void) {
                 NSMutableDictionary *retry = [options mutableCopy] ?: [NSMutableDictionary dictionary];
                 retry[@"forceInsecure"] = @YES;
                 return [self startWithLinks:links options:retry];
+            }
+        }
+
+        // Резолвер меняем только когда трафик через туннель уже доказан: иначе
+        // устройство останется без DNS вовсе.
+        if (localDNS && [_lastProbe[@"ok"] boolValue]) {
+            if (HVPNLocalDNSResponds()) {
+                HVPNRouteSystemDNSToLocal(@"127.0.0.1");
+                HVPNFlushDNSCache();
+            } else {
+                NSLog(@"[velad] локальный DNS не ответил — резолвер не меняю");
             }
         }
 
@@ -725,6 +873,8 @@ static NSString *HVPNPrimaryInterface(void) {
                                  [route[@"ifindex"] unsignedIntValue]);
     }
     [_ifaceRoutes removeAllObjects];
+
+    HVPNRestoreSystemDNS();
 
     for (NSArray *host in [_hostRoutes reverseObjectEnumerator]) {
         HVPNRouteDeleteHost([host[0] intValue], host[1], host[2], 0);

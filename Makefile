@@ -1,6 +1,6 @@
 export TARGET = iphone:clang:latest:12.0
 export ARCHS = arm64
-export PACKAGE_VERSION = 0.2.19
+export PACKAGE_VERSION = 0.2.20
 export FINALPACKAGE = 1
 
 include $(THEOS)/makefiles/common.mk
@@ -37,7 +37,7 @@ velad_FILES = \
 	shared/HVPNLinkUtil.m \
 	shared/HVPNConfig.m
 
-velad_FRAMEWORKS = Foundation
+velad_FRAMEWORKS = Foundation SystemConfiguration
 velad_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
 	-I$(THEOS_PROJECT_DIR)/shared -I$(THEOS_PROJECT_DIR)/daemon
 velad_INSTALL_PATH = /usr/libexec
