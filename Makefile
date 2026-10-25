@@ -1,6 +1,6 @@
 export TARGET = iphone:clang:latest:12.0
 export ARCHS = arm64
-export PACKAGE_VERSION = 0.2.20
+export PACKAGE_VERSION = 1.0.0
 export FINALPACKAGE = 1
 
 include $(THEOS)/makefiles/common.mk

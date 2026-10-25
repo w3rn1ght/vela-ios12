@@ -714,7 +714,7 @@ static NSString *HVPNPingText(HVPNNode *node) {
         [out appendFormat:@"  www.youtube.com A:    %@\n", [self dnsProbe:@"www.youtube.com" qtype:1]];
         [out appendFormat:@"  www.youtube.com AAAA: %@\n", [self dnsProbe:@"www.youtube.com" qtype:28]];
         [out appendFormat:@"  i.ytimg.com A:        %@\n", [self dnsProbe:@"i.ytimg.com" qtype:1]];
-        [out appendFormat:@"  admin.fixcord.gg A:   %@\n", [self dnsProbe:@"admin.fixcord.gg" qtype:1]];
+        [out appendFormat:@"  github.com A:         %@\n", [self dnsProbe:@"github.com" qtype:1]];
 
         NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         config.timeoutIntervalForRequest = 15;

@@ -3,107 +3,9 @@ name: build-deb
 on:
   push:
   workflow_dispatch:
-    inputs:
-      core:
-        description: "Пересобрать ядро sing-box (нужен macOS-раннер)"
-        type: boolean
-        default: false
 
 jobs:
-  # Основной путь: Linux-раннер + готовое ядро из релиза core-1.14.3-lx.23.
-  # macOS-минуты в аккаунте кончились, а ядро меняется редко — для его пересборки
-  # есть отдельный джоб ниже (workflow_dispatch с core=true).
   deb:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.core == false }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Зависимости
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang make git curl ca-certificates zip fakeroot dpkg-dev xz-utils \
-            libplist-dev libssl-dev libxml2-dev zlib1g-dev libcurl4-openssl-dev
-
-      - name: ldid
-        run: |
-          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
-          make -C /tmp/ldid -j"$(nproc)"
-          sudo install -m 755 /tmp/ldid/ldid /usr/local/bin/ldid
-          which ldid
-
-      - name: Theos + SDK
-        run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-          mkdir -p "$HOME/theos/sdks"
-          curl -sL -o /tmp/sdks.tar.gz https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
-          tar -xzf /tmp/sdks.tar.gz -C /tmp
-          cp -R /tmp/sdks-master/*.sdk "$HOME/theos/sdks/"
-          ls "$HOME/theos/sdks"
-
-      - name: Готовое ядро sing-box
-        run: |
-          set -euo pipefail
-          curl -sL -o /tmp/core.tar.gz \
-            https://github.com/w3rn1ght/vela-ios12/releases/download/core-1.14.3-lx.23/sing-box-ios-arm64.tar.gz
-          test -s /tmp/core.tar.gz
-          mkdir -p layout/usr/libexec/vela
-          tar -xzf /tmp/core.tar.gz -C layout/usr/libexec/vela
-          chmod 755 layout/usr/libexec/vela/sing-box
-          file layout/usr/libexec/vela/sing-box
-
-      - name: Сборка .deb
-        run: make package
-
-      - name: Сборка .ipa
-        run: |
-          set -euo pipefail
-          APP=".theos/_/Applications/Vela.app"
-          test -d "$APP"
-          rm -rf build/ipa
-          mkdir -p build/ipa/Payload
-          cp -R "$APP" build/ipa/Payload/Vela.app
-          VERSION=$(sed -n 's/^export PACKAGE_VERSION = //p' Makefile)
-          cd build/ipa
-          zip -qry "../Vela-${VERSION}.ipa" Payload
-          cd ../..
-          ls -lh build/*.ipa
-
-      - name: Проверка содержимого
-        run: |
-          set -euo pipefail
-          echo "--- ядро ---"
-          file layout/usr/libexec/vela/sing-box
-          echo "--- демон ---"
-          file .theos/obj/arm64/velad || true
-          echo "--- бинарь приложения ---"
-          file .theos/_/Applications/Vela.app/Vela
-          echo "--- иконки ---"
-          ls -1 .theos/_/Applications/Vela.app/*.png | wc -l
-          echo "--- info.plist ---"
-          python3 -c "import plistlib,sys; p=plistlib.load(open('.theos/_/Applications/Vela.app/Info.plist','rb')); print('CFBundleIconName:', p.get('CFBundleIconName')); print('CFBundleShortVersionString:', p.get('CFBundleShortVersionString')); sys.exit(1 if p.get('CFBundleIconName') else 0)"
-          echo "--- deb ---"
-          ls -lh packages/
-          dpkg-deb -I packages/*.deb | head -12
-          dpkg-deb -c packages/*.deb | head -20
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vela-deb
-          path: packages/*.deb
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vela-ipa
-          path: build/*.ipa
-          if-no-files-found: error
-
-  # Пересборка ядра (и полный прогон) на macOS — только вручную.
-  deb-core:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.core }}
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -150,11 +52,30 @@ jobs:
           cd ../..
           ls -lh build/*.ipa
 
-      - name: Core as artifact
+      - name: Inspect binaries
         run: |
-          mkdir -p build/core
-          cp layout/usr/libexec/vela/sing-box build/core/sing-box-ios-arm64
-          tar -czf build/core/sing-box-ios-arm64.tar.gz -C build/core sing-box-ios-arm64 2>/dev/null || true
+          echo "--- core ---"
+          file layout/usr/libexec/vela/sing-box
+          vtool -show-build layout/usr/libexec/vela/sing-box || true
+          echo "--- daemon ---"
+          file .theos/obj/arm64/velad
+          echo "--- icons ---"
+          ls -1 .theos/_/Applications/Vela.app/*.png | wc -l
+          for f in AppIcon60x60@2x.png AppIcon60x60@3x.png Icon-Small@2x.png Icon-72@2x.png; do
+            sips -g pixelWidth -g pixelHeight ".theos/_/Applications/Vela.app/$f" 2>/dev/null | tail -2 | tr '\n' ' '
+            echo " <- $f"
+          done
+          echo "--- icon keys ---"
+          plutil -p .theos/_/Applications/Vela.app/Info.plist | grep -i -E "icon" || true
+          if plutil -p .theos/_/Applications/Vela.app/Info.plist | grep -q CFBundleIconName; then
+            echo "ERROR: CFBundleIconName присутствует — iOS 12 будет искать Assets.car и иконка станет пустой"
+            exit 1
+          fi
+          echo "CFBundleIconName отсутствует: ok"
+          echo "--- deb ---"
+          ls -lh packages/
+          dpkg-deb -I packages/*.deb 2>/dev/null || true
+          dpkg-deb -c packages/*.deb 2>/dev/null | sed -n '1,40p' || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -166,10 +87,4 @@ jobs:
         with:
           name: vela-ipa
           path: build/*.ipa
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vela-core
-          path: layout/usr/libexec/vela/sing-box
           if-no-files-found: error
