@@ -37,7 +37,7 @@ velad_FILES = \
 	shared/HVPNLinkUtil.m \
 	shared/HVPNConfig.m
 
-velad_FRAMEWORKS = Foundation SystemConfiguration
+velad_FRAMEWORKS = Foundation
 velad_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
 	-I$(THEOS_PROJECT_DIR)/shared -I$(THEOS_PROJECT_DIR)/daemon
 velad_INSTALL_PATH = /usr/libexec

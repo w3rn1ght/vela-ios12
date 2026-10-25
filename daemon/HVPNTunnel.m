@@ -22,7 +22,7 @@
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <crt_externs.h>
-#import <SystemConfiguration/SystemConfiguration.h>
+#include <dlfcn.h>
 
 static NSString *const kBaseDir = HVPNStateDir;
 static NSString *const kConfigPath = HVPNCoreConfigPath;
@@ -127,21 +127,54 @@ static NSDictionary *HVPNReadDNSBackup(void) {
     return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
+// SCDynamicStore в iOS SDK помечен как недоступный для приложений, но в системе
+// он есть (им пользуется configd). Поэтому символы берём через dlsym: если их
+// нет — просто не трогаем резолвер и работаем как раньше.
+typedef void *(*HVPNSCDCreateFn)(CFAllocatorRef, CFStringRef, void *, void *);
+typedef void *(*HVPNSCDCopyFn)(void *, CFStringRef);
+typedef unsigned char (*HVPNSCDSetFn)(void *, CFStringRef, CFPropertyListRef);
+
+static void *sSCDStore;
+static HVPNSCDCopyFn sSCDCopy;
+static HVPNSCDSetFn sSCDSet;
+static BOOL sSCDReady;
+
+static BOOL HVPNSCDInit(void) {
+    if (sSCDReady) return sSCDStore != NULL;
+    sSCDReady = YES;
+
+    void *handle = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration",
+                          RTLD_LAZY);
+    if (handle == NULL) {
+        NSLog(@"[velad] SystemConfiguration не загрузилась: %s", dlerror());
+        return NO;
+    }
+    HVPNSCDCreateFn create = (HVPNSCDCreateFn)dlsym(handle, "SCDynamicStoreCreate");
+    sSCDCopy = (HVPNSCDCopyFn)dlsym(handle, "SCDynamicStoreCopyValue");
+    sSCDSet = (HVPNSCDSetFn)dlsym(handle, "SCDynamicStoreSetValue");
+    if (create == NULL || sSCDCopy == NULL || sSCDSet == NULL) {
+        NSLog(@"[velad] SCDynamicStore API в системе не найдено");
+        return NO;
+    }
+    sSCDStore = create(kCFAllocatorDefault, CFSTR("velad"), NULL, NULL);
+    if (sSCDStore == NULL) {
+        NSLog(@"[velad] SCDynamicStore не создался");
+        return NO;
+    }
+    return YES;
+}
+
 // Подменяет адрес системного резолвера на локальный листенер ядра.
 // ВАЖНО: перед вызовом запросы должны попадать в DNS-модуль (hijack-dns).
 static void HVPNRouteSystemDNSToLocal(NSString *server) {
-    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("velad"), NULL, NULL);
-    if (store == NULL) {
-        NSLog(@"[velad] SCDynamicStore недоступен, резолвер не меняю");
-        return;
-    }
+    if (!HVPNSCDInit()) return;
 
     NSMutableArray<NSString *> *keys = [NSMutableArray array];
     [keys addObject:@"State:/Network/Global/DNS"];
-    CFPropertyListRef globalIPv4 = SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/IPv4"));
+    void *globalIPv4 = sSCDCopy(sSCDStore, CFSTR("State:/Network/Global/IPv4"));
     if (globalIPv4 != NULL) {
-        NSDictionary *info = CFBridgingRelease(globalIPv4);
-        NSString *service = info[@"PrimaryService"];
+        NSDictionary *info = CFBridgingRelease((CFTypeRef)globalIPv4);
+        NSString *service = [info isKindOfClass:[NSDictionary class]] ? info[@"PrimaryService"] : nil;
         if ([service isKindOfClass:[NSString class]] && service.length > 0) {
             [keys addObject:[NSString stringWithFormat:@"State:/Network/Service/%@/DNS", service]];
         }
@@ -151,8 +184,8 @@ static void HVPNRouteSystemDNSToLocal(NSString *server) {
     if (HVPNReadDNSBackup() == nil) {
         NSMutableDictionary *backup = [NSMutableDictionary dictionary];
         for (NSString *key in keys) {
-            CFPropertyListRef old = SCDynamicStoreCopyValue(store, (__bridge CFStringRef)key);
-            if (old != NULL) backup[key] = CFBridgingRelease(old);
+            void *old = sSCDCopy(sSCDStore, (__bridge CFStringRef)key);
+            if (old != NULL) backup[key] = CFBridgingRelease((CFTypeRef)old);
         }
         NSData *json = [NSJSONSerialization dataWithJSONObject:backup options:0 error:NULL];
         [json writeToFile:HVPNDNSBackupPath() atomically:YES];
@@ -160,11 +193,10 @@ static void HVPNRouteSystemDNSToLocal(NSString *server) {
 
     NSDictionary *value = @{@"ServerAddresses": @[server]};
     for (NSString *key in keys) {
-        BOOL ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)key,
-                                         (__bridge CFDictionaryRef)value);
+        BOOL ok = sSCDSet(sSCDStore, (__bridge CFStringRef)key,
+                          (__bridge CFPropertyListRef)value) != 0;
         NSLog(@"[velad] резолвер %@ -> %@: %@", key, server, ok ? @"ок" : @"отказ");
     }
-    CFRelease(store);
 }
 
 // Возврат исходного резолвера. Вызывается и при старте демона: если прошлый запуск
@@ -172,16 +204,14 @@ static void HVPNRouteSystemDNSToLocal(NSString *server) {
 static void HVPNRestoreSystemDNS(void) {
     NSDictionary *backup = HVPNReadDNSBackup();
     if (backup == nil) return;
-    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("velad"), NULL, NULL);
-    if (store == NULL) return;
+    if (!HVPNSCDInit()) return;
     for (NSString *key in backup) {
         NSDictionary *value = backup[key];
         if (![value isKindOfClass:[NSDictionary class]]) continue;
-        BOOL ok = SCDynamicStoreSetValue(store, (__bridge CFStringRef)key,
-                                         (__bridge CFDictionaryRef)value);
+        BOOL ok = sSCDSet(sSCDStore, (__bridge CFStringRef)key,
+                          (__bridge CFPropertyListRef)value) != 0;
         NSLog(@"[velad] резолвер %@ восстановлен: %@", key, ok ? @"ок" : @"отказ");
     }
-    CFRelease(store);
     [[NSFileManager defaultManager] removeItemAtPath:HVPNDNSBackupPath() error:NULL];
 }
 
